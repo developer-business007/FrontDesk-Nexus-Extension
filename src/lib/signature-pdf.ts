@@ -1,0 +1,86 @@
+import { decryptBinary } from './encryption'
+import { resolveDownloadUrl } from './b2-storage'
+import { createExtensionSupabase } from './supabase-factory'
+
+/**
+ * Returns the most recent `storage_path` (encrypted reg card PDF) from the `signatures` table
+ * for the given confirmation number, or null if none exists.
+ */
+export async function fetchLatestSignatureStoragePath(confirmationNumber: string): Promise<string | null> {
+  const supabase = createExtensionSupabase()
+  const { data, error } = await supabase
+    .from('signatures')
+    .select('storage_path')
+    .eq('confirmation_number', confirmationNumber)
+    .not('storage_path', 'is', null)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()
+  if (error || !data) return null
+  return typeof data.storage_path === 'string' ? data.storage_path : null
+}
+
+/**
+ * Returns the most recent `signature_image_path` stored in the `signatures` table
+ * for the given confirmation number, or null if none exists.
+ */
+export async function fetchLatestSignatureImagePath(confirmationNumber: string): Promise<string | null> {
+  const supabase = createExtensionSupabase()
+  const { data, error } = await supabase
+    .from('signatures')
+    .select('signature_image_path')
+    .eq('confirmation_number', confirmationNumber)
+    .not('signature_image_path', 'is', null)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()
+  if (error || !data) return null
+  return typeof data.signature_image_path === 'string' ? data.signature_image_path : null
+}
+
+/** Download encrypted PDF from storage, decrypt, return application/pdf blob. */
+export async function fetchDecryptSignaturePdf(storagePath: string): Promise<Blob> {
+  const signedUrl = await resolveDownloadUrl({
+    category: 'signature-pdfs',
+    objectPath: storagePath,
+    expiresIn: 3600,
+  })
+
+  const res = await fetch(signedUrl)
+  if (!res.ok) throw new Error(`Download failed (HTTP ${res.status})`)
+
+  const buf = await res.arrayBuffer()
+  const decrypted = await decryptBinary(new Uint8Array(buf))
+  const ab = new Uint8Array(decrypted).buffer
+  return new Blob([ab], { type: 'application/pdf' })
+}
+
+/**
+ * Download the encrypted signature PNG from the `guest-signatures` bucket,
+ * decrypt it, and return a `data:image/png;base64,...` data URL.
+ *
+ * The returned string is accepted directly by pdf-lib's `embedPng()` so you
+ * can stamp the guest's signature onto any new PDF without asking them to sign again.
+ *
+ * Usage:
+ *   const pngDataUrl = await fetchSignaturePng(signatureImagePath)
+ *   const pngImage   = await pdfDoc.embedPng(pngDataUrl)
+ *   page.drawImage(pngImage, { x, y, width, height })
+ */
+export async function fetchSignaturePng(imagePath: string): Promise<string> {
+  const signedUrl = await resolveDownloadUrl({
+    category: 'guest-signatures',
+    objectPath: imagePath,
+    expiresIn: 3600,
+  })
+
+  const res = await fetch(signedUrl)
+  if (!res.ok) throw new Error(`Signature PNG download failed (HTTP ${res.status})`)
+
+  const buf = await res.arrayBuffer()
+  const decrypted = await decryptBinary(new Uint8Array(buf))
+
+  let binary = ''
+  for (let i = 0; i < decrypted.length; i++) binary += String.fromCharCode(decrypted[i])
+  return `data:image/png;base64,${btoa(binary)}`
+}

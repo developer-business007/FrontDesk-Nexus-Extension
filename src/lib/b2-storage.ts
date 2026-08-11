@@ -1,0 +1,182 @@
+import type { SupabaseClient } from '@supabase/supabase-js'
+import { createExtensionSupabase } from './supabase-factory'
+
+export type StorageCategory = 'id-images' | 'signature-pdfs' | 'guest-signatures'
+
+type UploadUrlResponse = {
+  uploadUrl?: string
+  authorizationToken?: string
+  fileName?: string
+  contentType?: string
+  objectKey?: string
+  uploadMode?: string
+  error?: string
+}
+
+type DownloadUrlResponse = {
+  downloadUrl?: string
+  objectKey?: string
+  missing?: boolean
+  error?: string
+}
+
+function invokeErrorMessage(error: unknown, data: { error?: string } | null): string {
+  if (data?.error) return data.error
+  if (error && typeof error === 'object' && 'message' in error) {
+    return String((error as { message: string }).message)
+  }
+  return 'Storage request failed'
+}
+
+/** slice() yields a plain ArrayBuffer (not SharedArrayBuffer) for SubtleCrypto / fetch. */
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer
+}
+
+async function sha256Hex(data: BufferSource): Promise<string> {
+  const hash = await crypto.subtle.digest('SHA-256', data)
+  return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+async function toUint8Array(body: Blob | ArrayBuffer | Uint8Array): Promise<Uint8Array> {
+  if (body instanceof Uint8Array) return body
+  if (body instanceof ArrayBuffer) return new Uint8Array(body)
+  return new Uint8Array(await body.arrayBuffer())
+}
+
+export async function getStorageUploadUrl(
+  client: SupabaseClient,
+  args: {
+    category: StorageCategory
+    objectPath: string
+    contentType: string
+    size?: number
+  },
+): Promise<{
+  uploadUrl: string
+  authorizationToken: string
+  fileName: string
+  contentType: string
+  objectKey: string
+}> {
+  const { data, error } = await client.functions.invoke<UploadUrlResponse>('storage-upload-url', {
+    body: {
+      category: args.category,
+      objectPath: args.objectPath,
+      contentType: args.contentType,
+      size: args.size,
+    },
+  })
+  if (error || !data?.uploadUrl || !data.authorizationToken || !data.fileName) {
+    throw new Error(invokeErrorMessage(error, data ?? null))
+  }
+  return {
+    uploadUrl: data.uploadUrl,
+    authorizationToken: data.authorizationToken,
+    fileName: data.fileName,
+    contentType: data.contentType ?? args.contentType,
+    objectKey: data.objectKey ?? args.objectPath,
+  }
+}
+
+export async function getStorageDownloadUrl(
+  client: SupabaseClient,
+  args: {
+    category: StorageCategory
+    objectPath: string
+    expiresIn?: number
+    checkExists?: boolean
+  },
+): Promise<string> {
+  const { data, error } = await client.functions.invoke<DownloadUrlResponse>(
+    'storage-download-url',
+    {
+      body: {
+        category: args.category,
+        objectPath: args.objectPath,
+        expiresIn: args.expiresIn ?? 600,
+        checkExists: args.checkExists === true,
+      },
+    },
+  )
+  if (error || !data?.downloadUrl) {
+    throw new Error(invokeErrorMessage(error, data ?? null))
+  }
+  return data.downloadUrl
+}
+
+export async function uploadBytesToB2(
+  client: SupabaseClient,
+  args: {
+    category: StorageCategory
+    objectPath: string
+    body: Blob | ArrayBuffer | Uint8Array
+    contentType: string
+  },
+): Promise<void> {
+  const bytes = await toUint8Array(args.body)
+  const buffer = toArrayBuffer(bytes)
+  const upload = await getStorageUploadUrl(client, {
+    category: args.category,
+    objectPath: args.objectPath,
+    contentType: args.contentType,
+    size: buffer.byteLength,
+  })
+
+  const res = await fetch(upload.uploadUrl, {
+    method: 'POST',
+    headers: {
+      Authorization: upload.authorizationToken,
+      'X-Bz-File-Name': encodeURIComponent(upload.fileName),
+      'X-Bz-Content-Sha256': await sha256Hex(buffer),
+      'Content-Type': upload.contentType,
+      'Content-Length': String(buffer.byteLength),
+    },
+    body: buffer,
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(
+      `B2 upload failed (HTTP ${res.status})${text ? `: ${text.slice(0, 200)}` : ''}`,
+    )
+  }
+}
+
+export async function resolveDownloadUrl(args: {
+  category: StorageCategory
+  objectPath: string
+  expiresIn?: number
+  supabaseFallbackBuckets?: string[]
+}): Promise<string> {
+  const path = args.objectPath.trim()
+  if (!path) throw new Error('Empty storage path')
+  const supabase = createExtensionSupabase()
+
+  try {
+    return await getStorageDownloadUrl(supabase, {
+      category: args.category,
+      objectPath: path,
+      expiresIn: args.expiresIn,
+      checkExists: true,
+    })
+  } catch {
+    // fall through
+  }
+
+  const buckets = args.supabaseFallbackBuckets?.length
+    ? args.supabaseFallbackBuckets
+    : [args.category]
+
+  let lastMessage = 'Could not create signed URL'
+  for (const bucket of buckets) {
+    const { data, error } = await supabase.storage
+      .from(bucket)
+      .createSignedUrl(path, args.expiresIn ?? 3600)
+    if (error) {
+      lastMessage = error.message
+      continue
+    }
+    if (data?.signedUrl) return data.signedUrl
+  }
+  throw new Error(lastMessage)
+}
