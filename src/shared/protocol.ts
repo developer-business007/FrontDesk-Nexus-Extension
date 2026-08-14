@@ -441,6 +441,8 @@ export type ExtensionMessage =
   | { type: 'RFID_CHECK_CONNECTION' }
   /** Switch the active ID scanner; persisted in Chrome storage. */
   | { type: 'SELECT_SCANNER'; scanner: 'thales' | 'twain' }
+  /** Ambir nScan 690gt: Auto (insert card) vs Manual (click Scan ID, then insert). */
+  | { type: 'SELECT_NSCAN690GT_SCAN_MODE'; mode: 'auto' | 'manual' }
   /** Fire a TWAIN scan on the currently selected TWAIN device (Ambir DS690gt). */
   | { type: 'TRIGGER_SCAN_TWAIN' }
   /** Look up previous scans by ID number hash to detect returning guests. */
@@ -613,6 +615,8 @@ export type ExtensionState = {
   lastError: string | null
   /** Which ID scanner the staff has chosen; persisted in Chrome storage. */
   selectedScanner: 'thales' | 'twain'
+  /** nScan 690gt scan mode when {@link selectedScanner} is `twain`. */
+  nscan690gtScanMode: 'auto' | 'manual'
 }
 
 /** Service worker → side panel: two-pass DL scan, one side received (other not yet scanned). */

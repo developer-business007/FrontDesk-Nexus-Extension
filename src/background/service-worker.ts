@@ -113,6 +113,7 @@ let rfidError: string | null = null
 let rfidStatusCheckedAt = 0
 let idScannerStatusCheckedAt = 0
 let selectedScanner: 'thales' | 'twain' = 'thales'
+let nscan690gtScanMode: 'auto' | 'manual' = 'manual'
 
 // ── ID scanner hardware status cache ─────────────────────────────────────────
 // Refreshed proactively every 10 s via setInterval so GET_STATE always returns
@@ -1635,6 +1636,14 @@ async function loadExtensionHotelSettings(
   return cachedExtensionHotelSettings
 }
 
+async function syncNscan690gtScanModeToHost(mode: 'auto' | 'manual'): Promise<void> {
+  try {
+    await sendNativeRequest({ type: 'SET_NSCAN690GT_SCAN_MODE', mode }, 8_000)
+  } catch (e) {
+    console.warn('[FDN nScan690gt] failed to sync scan mode to host:', e)
+  }
+}
+
 async function restorePersistedReservationState(): Promise<void> {
   const stored = await chrome.storage.local.get([
     'fdn_active_reservation',
@@ -1644,9 +1653,13 @@ async function restorePersistedReservationState(): Promise<void> {
     'fdn_ezee_group_base_snapshot',
     'fdn_ezee_group_base_display',
     'fdn_selected_scanner',
+    'fdn_nscan690gt_scan_mode',
   ])
   if (stored.fdn_selected_scanner === 'thales' || stored.fdn_selected_scanner === 'twain') {
     selectedScanner = stored.fdn_selected_scanner
+  }
+  if (stored.fdn_nscan690gt_scan_mode === 'auto' || stored.fdn_nscan690gt_scan_mode === 'manual') {
+    nscan690gtScanMode = stored.fdn_nscan690gt_scan_mode
   }
   if (!reservation && stored.fdn_active_reservation) {
     reservation = stored.fdn_active_reservation as ReservationSnapshot
@@ -1727,6 +1740,7 @@ async function getState(): Promise<ExtensionState> {
     seniorRecommendAge: hotelSettings.seniorRecommendAge,
     lastError,
     selectedScanner,
+    nscan690gtScanMode,
   }
 }
 
@@ -2845,6 +2859,14 @@ async function broadcastNativeIdScan(payload: Omit<NativeIdScanBroadcast, 'type'
 }
 
 async function handleThalesNativeScan(payload: NativeScanSuccessPayload) {
+  if (
+    payload.scanSource === 'nscan690gt_auto_watch' &&
+    (selectedScanner !== 'twain' || nscan690gtScanMode !== 'auto')
+  ) {
+    console.info('[FDN nScan690gt] ignored auto scan — Manual mode or Thales selected')
+    return
+  }
+
   const images = payload.images
   const b64Front = images.front_image_base64?.trim() ?? ''
   const b64Back = images.back_image_base64?.trim() ?? ''
@@ -4326,6 +4348,23 @@ async function handleMessage(
     if (s === 'thales' || s === 'twain') {
       selectedScanner = s
       void chrome.storage.local.set({ fdn_selected_scanner: s })
+      if (s === 'twain') {
+        void syncNscan690gtScanModeToHost(nscan690gtScanMode)
+      } else if (nscan690gtScanMode === 'auto') {
+        void syncNscan690gtScanModeToHost('manual')
+      }
+    }
+    return { ok: true, state: await getState() }
+  }
+
+  if (msg.type === 'SELECT_NSCAN690GT_SCAN_MODE') {
+    const mode = msg.mode
+    if (mode === 'auto' || mode === 'manual') {
+      nscan690gtScanMode = mode
+      void chrome.storage.local.set({ fdn_nscan690gt_scan_mode: mode })
+      if (selectedScanner === 'twain') {
+        void syncNscan690gtScanModeToHost(mode)
+      }
     }
     return { ok: true, state: await getState() }
   }
@@ -4333,32 +4372,36 @@ async function handleMessage(
   if (msg.type === 'TRIGGER_SCAN_TWAIN') {
     void (async () => {
       try {
-        const resp = await sendNativeRequest({ type: 'SCAN_DOCUMENT_NSCAN690GT' }, 60_000)
+        const resp = await sendNativeRequest({ type: 'SCAN_DOCUMENT_NSCAN690GT' }, 90_000)
         if (!resp || resp.type === 'ERROR') {
           const errMsg =
             ((resp as Record<string, unknown>)?.message as string | undefined) ?? 'Scan failed'
-          console.warn('[FDN TWAIN] scan failed:', errMsg)
+          console.warn('[FDN nScan690gt] scan failed:', errMsg)
           try {
             await chrome.runtime.sendMessage({ type: 'FDN_TWAIN_SCAN_ERROR', message: errMsg })
           } catch { /* panel may be closed */ }
           return
         }
-        // Use the same image for both front/back slots so isCompleteTwoSidedScan
-        // returns true and broadcastNativeIdScan fills the form.
-        const img =
-          ((resp as Record<string, unknown>).image_base64 as string | undefined)?.trim() ||
-          ((resp as Record<string, unknown>).image_front_base64 as string | undefined)?.trim() ||
+        const r = resp as Record<string, unknown>
+        const front =
+          (r.image_front_base64 as string | undefined)?.trim() ||
+          (r.front_image_base64 as string | undefined)?.trim() ||
+          (r.image_base64 as string | undefined)?.trim() ||
           ''
-        const docData = ((resp as Record<string, unknown>).document_data ?? resp) as Record<string, unknown>
+        const back =
+          (r.image_back_base64 as string | undefined)?.trim() ||
+          (r.back_image_base64 as string | undefined)?.trim() ||
+          ''
+        const docData = (r.document_data ?? resp) as Record<string, unknown>
         const payload: NativeScanSuccessPayload = {
-          images: { front_image_base64: img, back_image_base64: img },
+          images: { front_image_base64: front, back_image_base64: back || front },
           parsed: parsedFieldsFromHost(resp as Record<string, unknown>),
           detail: null,
           documentData: docData,
         }
         await handleThalesNativeScan(payload)
       } catch (err) {
-        console.warn('[FDN TWAIN] scan error:', err)
+        console.warn('[FDN nScan690gt] scan error:', err)
         const errMsg = err instanceof Error ? err.message : 'Scan error'
         try {
           await chrome.runtime.sendMessage({ type: 'FDN_TWAIN_SCAN_ERROR', message: errMsg })
@@ -4670,7 +4713,19 @@ chrome.runtime.onMessageExternal.addListener((message, _sender, sendResponse) =>
   return true
 })
 
-void initNativeHost(handleThalesNativeScan, forwardNativeHostRxToPanel, handleRfidStatus, broadcastScanSideResult)
+void initNativeHost(
+  handleThalesNativeScan,
+  forwardNativeHostRxToPanel,
+  handleRfidStatus,
+  broadcastScanSideResult,
+  () => {
+    void restorePersistedReservationState().then(() => {
+      if (selectedScanner === 'twain') {
+        void syncNscan690gtScanModeToHost(nscan690gtScanMode)
+      }
+    })
+  },
+)
 
 // Proactively refresh scanner connection status every 10 s so the side panel
 // always shows current state without any manual action.

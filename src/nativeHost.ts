@@ -339,6 +339,7 @@ export type NativeHostAutoScanPayload = {
   flat: AutoScanFlatFields
   parsed: ParsedIdFields
   detail: IdScanDetailGuru
+  scanSource?: string
 }
 
 export type NativeHostScanCallback = (payload: NativeScanSuccessPayload) => void | Promise<void>
@@ -487,6 +488,7 @@ export function initNativeHost(
   onPanelDebug?: NativeHostPanelDebugFn,
   onRfidStatus?: (connected: boolean, error: string | null) => void,
   onScanSide?: NativeHostScanSideCallback,
+  onConnected?: () => void,
 ): void {
   const connect = () => {
     if (nativePort != null) {
@@ -530,6 +532,7 @@ export function initNativeHost(
       host: NATIVE_HOST_NAME,
       portName,
     })
+    onConnected?.()
 
     port.onMessage.addListener((raw: unknown) => {
       const rxAt = new Date().toISOString()
@@ -644,6 +647,7 @@ export function initNativeHost(
           flat,
           parsed,
           detail,
+          scanSource: typeof raw.source === 'string' ? raw.source : undefined,
         }
         emitNativePanelDebug(onPanelDebug, {
           type: 'FDN_NATIVE_HOST_RX',
@@ -762,6 +766,7 @@ async function onExtendedScan(
     parsed: merged,
     detail: extended.detail,
     documentData: extended.document_data,
+    scanSource: extended.scanSource,
   })
 }
 

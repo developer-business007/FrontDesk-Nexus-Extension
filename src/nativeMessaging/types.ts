@@ -40,6 +40,8 @@ export type NativeScanSuccessPayload = {
   detail?: IdScanDetailGuru | null
   /** Optional raw snapshot from Python (AUTO_SCAN_RESULT). */
   documentData?: Record<string, unknown> | null
+  /** e.g. `nscan690gt_auto_watch` — used to filter auto scans when Manual mode is active. */
+  scanSource?: string
 }
 
 // ── RFID Key Card Encoder ─────────────────────────────────────────────────────

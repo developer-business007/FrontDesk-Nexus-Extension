@@ -3312,33 +3312,78 @@ function App() {
                       {/* TWAIN scan trigger — visible only when nScan 690gt is selected */}
                       {!manualEntry && (state?.selectedScanner ?? 'thales') === 'twain' ? (
                         <div className="fdn-twain-scan-wrap">
-                          <button
-                            type="button"
-                            className="fdn-twain-scan-btn"
-                            disabled={twainScanBusy}
-                            title="Scan ID card with nScan 690gt — insert card after clicking"
-                            onClick={async () => {
-                              if (twainScanTimeoutRef.current !== null) {
-                                clearTimeout(twainScanTimeoutRef.current)
-                              }
-                              setTwainScanError(null)
-                              setTwainScanBusy(true)
-                              // 65s fallback: reset busy if no FDN_NATIVE_ID_SCAN arrives
-                              twainScanTimeoutRef.current = setTimeout(() => {
-                                twainScanTimeoutRef.current = null
-                                setTwainScanBusy(false)
-                              }, 65_000)
-                              try {
-                                await chrome.runtime.sendMessage({ type: 'TRIGGER_SCAN_TWAIN' })
-                              } catch {
-                                clearTimeout(twainScanTimeoutRef.current ?? undefined)
-                                twainScanTimeoutRef.current = null
-                                setTwainScanBusy(false)
-                              }
-                            }}
-                          >
-                            {twainScanBusy ? 'Scanning…' : 'Scan ID'}
-                          </button>
+                          <div className="fdn-nscan690gt-mode">
+                            <button
+                              type="button"
+                              className={[
+                                'fdn-nscan690gt-mode-btn',
+                                (state?.nscan690gtScanMode ?? 'manual') === 'auto'
+                                  ? 'fdn-nscan690gt-mode-btn--active'
+                                  : '',
+                              ].join(' ')}
+                              disabled={twainScanBusy}
+                              title="Auto — insert card to scan (like AmbirScan Auto)"
+                              onClick={() => {
+                                void chrome.runtime
+                                  .sendMessage({ type: 'SELECT_NSCAN690GT_SCAN_MODE', mode: 'auto' })
+                                  .then((res) => {
+                                    if (res?.state) setState(res.state as typeof state)
+                                    setTwainScanError(null)
+                                  })
+                              }}
+                            >
+                              Auto
+                            </button>
+                            <button
+                              type="button"
+                              className={[
+                                'fdn-nscan690gt-mode-btn',
+                                (state?.nscan690gtScanMode ?? 'manual') === 'manual'
+                                  ? 'fdn-nscan690gt-mode-btn--active'
+                                  : '',
+                              ].join(' ')}
+                              disabled={twainScanBusy}
+                              title="Manual — click Scan ID, then insert card (like AmbirScan Manual)"
+                              onClick={() => {
+                                void chrome.runtime
+                                  .sendMessage({ type: 'SELECT_NSCAN690GT_SCAN_MODE', mode: 'manual' })
+                                  .then((res) => {
+                                    if (res?.state) setState(res.state as typeof state)
+                                    setTwainScanError(null)
+                                  })
+                              }}
+                            >
+                              Manual
+                            </button>
+                          </div>
+                          {(state?.nscan690gtScanMode ?? 'manual') === 'manual' ? (
+                            <button
+                              type="button"
+                              className="fdn-twain-scan-btn"
+                              disabled={twainScanBusy}
+                              title="Scan ID card with nScan 690gt — insert card after clicking"
+                              onClick={async () => {
+                                if (twainScanTimeoutRef.current !== null) {
+                                  clearTimeout(twainScanTimeoutRef.current)
+                                }
+                                setTwainScanError(null)
+                                setTwainScanBusy(true)
+                                twainScanTimeoutRef.current = setTimeout(() => {
+                                  twainScanTimeoutRef.current = null
+                                  setTwainScanBusy(false)
+                                }, 65_000)
+                                try {
+                                  await chrome.runtime.sendMessage({ type: 'TRIGGER_SCAN_TWAIN' })
+                                } catch {
+                                  clearTimeout(twainScanTimeoutRef.current ?? undefined)
+                                  twainScanTimeoutRef.current = null
+                                  setTwainScanBusy(false)
+                                }
+                              }}
+                            >
+                              {twainScanBusy ? 'Scanning…' : 'Scan ID'}
+                            </button>
+                          ) : null}
                           <span
                             className={[
                               'fdn-twain-status',
@@ -3351,9 +3396,13 @@ function App() {
                           >
                             {twainScanBusy
                               ? '● Insert card…'
-                              : hw.id_scanner === 'connected'
-                                ? '● Ready'
-                                : '● Offline'}
+                              : (state?.nscan690gtScanMode ?? 'manual') === 'auto'
+                                ? hw.id_scanner === 'connected'
+                                  ? '● Insert card'
+                                  : '● Offline'
+                                : hw.id_scanner === 'connected'
+                                  ? '● Ready — click Scan ID'
+                                  : '● Offline'}
                           </span>
                           {twainScanError ? (
                             <span className="fdn-twain-error">{twainScanError}</span>
