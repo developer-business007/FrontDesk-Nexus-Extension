@@ -84,6 +84,7 @@ import { guessImageMimeFromBase64 } from '../lib/imageMime'
 import { pingNativeHost } from '../lib/native-scan'
 import type { NativeScanSuccessPayload } from '../nativeMessaging/types'
 import { parsedFieldsFromHost } from '../nativeMessaging/scanId'
+import { idGuruDetailFromAutoScan, mergeParsedWithGuru } from '../lib/id-guru-fields'
 import { initNativeHost, sendNativeMessage, sendNativeRequest } from '../nativeHost'
 import { checkMinExtensionVersion } from '../lib/version-check'
 import { toSdkDatetimeHotel } from '../lib/hotel-dates'
@@ -1636,6 +1637,17 @@ async function loadExtensionHotelSettings(
   return cachedExtensionHotelSettings
 }
 
+async function syncActiveScannerToHost(scanner: 'thales' | 'twain'): Promise<void> {
+  try {
+    await sendNativeRequest({ type: 'SET_ACTIVE_SCANNER', scanner }, 8_000)
+  } catch (e) {
+    console.warn('[FDN scanner] failed to set active scanner on host:', e)
+  }
+  if (scanner === 'twain') {
+    await syncNscan690gtScanModeToHost(nscan690gtScanMode)
+  }
+}
+
 async function syncNscan690gtScanModeToHost(mode: 'auto' | 'manual'): Promise<void> {
   try {
     await sendNativeRequest({ type: 'SET_NSCAN690GT_SCAN_MODE', mode }, 8_000)
@@ -2864,6 +2876,10 @@ async function handleThalesNativeScan(payload: NativeScanSuccessPayload) {
     (selectedScanner !== 'twain' || nscan690gtScanMode !== 'auto')
   ) {
     console.info('[FDN nScan690gt] ignored auto scan — Manual mode or Thales selected')
+    return
+  }
+  if (payload.scanSource === 'thales_auto_watch' && selectedScanner !== 'thales') {
+    console.info('[FDN Thales] ignored auto scan — nScan 690gt selected')
     return
   }
 
@@ -4348,11 +4364,7 @@ async function handleMessage(
     if (s === 'thales' || s === 'twain') {
       selectedScanner = s
       void chrome.storage.local.set({ fdn_selected_scanner: s })
-      if (s === 'twain') {
-        void syncNscan690gtScanModeToHost(nscan690gtScanMode)
-      } else if (nscan690gtScanMode === 'auto') {
-        void syncNscan690gtScanModeToHost('manual')
-      }
+      void syncActiveScannerToHost(s)
     }
     return { ok: true, state: await getState() }
   }
@@ -4392,11 +4404,15 @@ async function handleMessage(
           (r.image_back_base64 as string | undefined)?.trim() ||
           (r.back_image_base64 as string | undefined)?.trim() ||
           ''
-        const docData = (r.document_data ?? resp) as Record<string, unknown>
+        const docData =
+          r.document_data != null && typeof r.document_data === 'object' && !Array.isArray(r.document_data)
+            ? (r.document_data as Record<string, unknown>)
+            : r
+        const detail = idGuruDetailFromAutoScan(r, docData)
         const payload: NativeScanSuccessPayload = {
           images: { front_image_base64: front, back_image_base64: back || front },
-          parsed: parsedFieldsFromHost(resp as Record<string, unknown>),
-          detail: null,
+          parsed: mergeParsedWithGuru(parsedFieldsFromHost(r), detail),
+          detail,
           documentData: docData,
         }
         await handleThalesNativeScan(payload)
@@ -4720,9 +4736,7 @@ void initNativeHost(
   broadcastScanSideResult,
   () => {
     void restorePersistedReservationState().then(() => {
-      if (selectedScanner === 'twain') {
-        void syncNscan690gtScanModeToHost(nscan690gtScanMode)
-      }
+      void syncActiveScannerToHost(selectedScanner)
     })
   },
 )

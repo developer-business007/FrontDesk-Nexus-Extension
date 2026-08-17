@@ -3408,6 +3408,15 @@ function App() {
                             <span className="fdn-twain-error">{twainScanError}</span>
                           ) : null}
                         </div>
+                      ) : !manualEntry && (state?.selectedScanner ?? 'thales') === 'thales' ? (
+                        <span
+                          className={[
+                            'fdn-twain-status',
+                            hw.thalesConnected ? 'fdn-twain-status--ready' : 'fdn-twain-status--offline',
+                          ].join(' ')}
+                        >
+                          {hw.thalesConnected ? '● Place ID on QS2000' : '● QS2000 offline'}
+                        </span>
                       ) : null}
                       {/* Export dropdown */}
                       <div className="fdn-export-menu" ref={exportMenuRef}>
