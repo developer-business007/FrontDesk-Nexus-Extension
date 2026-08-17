@@ -22,7 +22,7 @@ const emptyParsed: ParsedIdFields = {
 
 function stringOrNull(v: unknown): string | null {
   if (typeof v !== 'string') return null
-  const t = v.trim()
+  const t = v.replace(/\r/g, '\n').split('\n')[0].trim()
   return t.length ? t : null
 }
 

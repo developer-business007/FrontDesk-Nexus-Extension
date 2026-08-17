@@ -4,16 +4,23 @@ import { ageYearsFromDobString } from './id-age'
 /** AAMVA PDF417 uses these sentinel strings to indicate an absent field. */
 const AAMVA_SENTINELS = new Set(['NONE', 'UNAVAILABLE', 'N/A', 'NA'])
 
+function guestString(v: unknown): string | null {
+  if (typeof v !== 'string') return null
+  const t = v.replace(/\r/g, '\n').split('\n')[0].trim()
+  if (!t || AAMVA_SENTINELS.has(t.toUpperCase())) return null
+  return t
+}
+
 function pick(
   doc: Record<string, unknown>,
   msg: Record<string, unknown>,
   ...keys: string[]
 ): string | null {
   for (const k of keys) {
-    const d = doc[k]
-    if (typeof d === 'string' && d.trim() && !AAMVA_SENTINELS.has(d.trim().toUpperCase())) return d.trim()
-    const v = msg[k]
-    if (typeof v === 'string' && v.trim() && !AAMVA_SENTINELS.has(v.trim().toUpperCase())) return v.trim()
+    const d = guestString(doc[k])
+    if (d) return d
+    const m = guestString(msg[k])
+    if (m) return m
   }
   return null
 }
