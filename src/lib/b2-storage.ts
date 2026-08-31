@@ -33,9 +33,16 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer
 }
 
+function hexFromDigest(buf: ArrayBuffer): string {
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+async function sha1Hex(data: BufferSource): Promise<string> {
+  return hexFromDigest(await crypto.subtle.digest('SHA-1', data))
+}
+
 async function sha256Hex(data: BufferSource): Promise<string> {
-  const hash = await crypto.subtle.digest('SHA-256', data)
-  return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, '0')).join('')
+  return hexFromDigest(await crypto.subtle.digest('SHA-256', data))
 }
 
 async function toUint8Array(body: Blob | ArrayBuffer | Uint8Array): Promise<Uint8Array> {
@@ -128,6 +135,8 @@ export async function uploadBytesToB2(
     headers: {
       Authorization: upload.authorizationToken,
       'X-Bz-File-Name': encodeURIComponent(upload.fileName),
+      // B2 requires Sha1; Sha256 is optional integrity extra.
+      'X-Bz-Content-Sha1': await sha1Hex(buffer),
       'X-Bz-Content-Sha256': await sha256Hex(buffer),
       'Content-Type': upload.contentType,
       'Content-Length': String(buffer.byteLength),
