@@ -90,12 +90,16 @@ type EzeeExtractPayload =
     }
   | { ok: false; error: string }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
 function buildExtractPayload(): EzeeExtractPayload {
   if (!isEzeeGuestScrapeAllowed(document)) {
     return {
       ok: false,
       error:
-        'Guest data is not available on this tab — open Guest Details or use the Arrivals guest drawer.',
+        'Guest data is not available on this tab — open Guest Details or Booking Details (not Folio), or use the guest drawer.',
     }
   }
 
@@ -105,7 +109,11 @@ function buildExtractPayload(): EzeeExtractPayload {
   const detailShell = isEzeeReservationDetailShell(document)
 
   let fields =
-    drawerOpen ? extractEzeeScrapeFields(document) : hasGroup && detailShell ? extractEzeeScrapeFieldsFromPage(document) : null
+    drawerOpen
+      ? extractEzeeScrapeFields(document)
+      : detailShell
+        ? extractEzeeScrapeFieldsFromPage(document)
+        : null
 
   if (!fields && (drawerOpen || detailShell)) {
     fields = extractEzeeScrapeFieldsFromPage(document)
@@ -113,12 +121,16 @@ function buildExtractPayload(): EzeeExtractPayload {
 
   if (!fields) {
     if (!drawerOpen && !detailShell) {
-      return { ok: false, error: 'Guest drawer is not open.' }
+      return {
+        ok: false,
+        error: 'Guest drawer is not open — click the guest in eZee so Room / Reservation Number is visible.',
+      }
     }
     console.warn('[FDN eZee] EZEE_EXTRACT_NOW: scrape failed', probeEzeeDrawer(document))
     return {
       ok: false,
-      error: 'Could not read complete guest data — open Guest Details or the Arrivals guest drawer.',
+      error:
+        'Could not read reservation number — open Guest Details / Booking Details or the guest drawer, then try Refresh stay again.',
     }
   }
 
@@ -126,7 +138,8 @@ function buildExtractPayload(): EzeeExtractPayload {
     console.warn('[FDN eZee] EZEE_EXTRACT_NOW: scrape failed', probeEzeeDrawer(document))
     return {
       ok: false,
-      error: 'Could not read complete guest data — open Guest Details or the Arrivals guest drawer.',
+      error:
+        'Could not read reservation number — open Guest Details / Booking Details or the guest drawer, then try Refresh stay again.',
     }
   }
 
@@ -143,6 +156,18 @@ function buildExtractPayload(): EzeeExtractPayload {
     guestDisplay: ezeeScrapeToGuestDisplay(fields),
     ...(hasGroup ? { groupMembers, activeGroupIndex } : {}),
   }
+}
+
+/** Retry briefly — Stayover drawer often paints labels before values. */
+async function buildExtractPayloadWithRetry(): Promise<EzeeExtractPayload> {
+  let last = buildExtractPayload()
+  if (last.ok) return last
+  for (const wait of [350, 700, 1200]) {
+    await sleep(wait)
+    last = buildExtractPayload()
+    if (last.ok) return last
+  }
+  return last
 }
 
 async function runDetection(): Promise<void> {
@@ -173,14 +198,15 @@ async function runDetection(): Promise<void> {
   }
   wasDrawerOpen = openNow
 
-  if (!openNow && !(hasGroup && detailShell)) return
+  // Stayover / in-house: detail shell alone (no group) must still auto-load.
+  if (!openNow && !detailShell && !hasGroup) return
 
   let fields = openNow ? extractEzeeScrapeFields(document) : null
-  if (!fields && hasGroup && detailShell) {
+  if (!fields && detailShell) {
     fields = extractEzeeScrapeFieldsFromPage(document)
   }
   if (!fields || !isCompleteEzeeGuestScrape(fields)) {
-    if (openNow || hasGroup) logThrottledFailProbe(probeEzeeDrawer(document))
+    if (openNow || detailShell || hasGroup) logThrottledFailProbe(probeEzeeDrawer(document))
     return
   }
 
@@ -285,8 +311,8 @@ chrome.runtime.onMessage.addListener(
       return
     }
     if (message?.type === 'EZEE_EXTRACT_NOW') {
-      sendResponse(buildExtractPayload())
-      return
+      void buildExtractPayloadWithRetry().then((payload) => sendResponse(payload))
+      return true
     }
     if (message?.type === 'GET_CURRENT_BALANCE') {
       const fields = extractEzeeScrapeFields(document)
@@ -319,8 +345,6 @@ type LastScanResult = {
 
 let _fillInProgress = false
 let _addResDebounce = 0
-
-const sleep = (ms: number) => new Promise<void>(r => window.setTimeout(r, ms))
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 

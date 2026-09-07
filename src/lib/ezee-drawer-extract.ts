@@ -198,6 +198,27 @@ function extractGuestPhoneFromText(fullText: string): string | null {
   return null
 }
 
+/** eZee often stacks "Room Number" on one line and "230" on the next. */
+function extractRoomNumberFromEzeeText(fullText: string): string | null {
+  const lines = fullText
+    .split(/\r?\n/)
+    .map((l) => l.replace(/\u00a0/g, ' ').trim())
+    .filter(Boolean)
+
+  for (let i = 0; i < lines.length - 1; i++) {
+    if (/^Room\s*Number$/i.test(lines[i]) || /^Room\s*No\.?$/i.test(lines[i])) {
+      const next = lines[i + 1].replace(/\s/g, '')
+      if (/^\d{2,5}$/.test(next)) return next
+    }
+  }
+
+  let m = fullText.match(/Room\s*Number\s*[:\s]*(\d{2,5})\b/i)
+  if (m?.[1]) return m[1]
+  m = fullText.match(/\bRm\.?\s*#?\s*(\d{2,5})\b/i)
+  if (m?.[1]) return m[1]
+  return null
+}
+
 /**
  * eZee stacks "Reservation Number" on one line and "2824" on the next — regex on flat text often misses.
  */
@@ -285,10 +306,11 @@ function mergeFields(
   const rMap = pickFromMap(map, 'reservation number', 'reservation no', 'reservation #')
   const r = (rLine ?? rMap ?? blob.reservationNumber ?? '').trim() || null
 
+  const roomLine = extractRoomNumberFromEzeeText(fullText)
   const room = pickFromMap(map, 'room number', 'room no', 'room #')
   const status = pickFromMap(map, 'status', 'reservation status')
-  const arr = pickFromMap(map, 'arrival date', 'check in', 'check-in')
-  const dep = pickFromMap(map, 'departure date', 'check out', 'check-out')
+  const arr = pickFromMap(map, 'arrival date', 'check in', 'check-in', 'arrival')
+  const dep = pickFromMap(map, 'departure date', 'check out', 'check-out', 'departure')
   const emailMap = pickFromMap(map, 'email', 'e-mail')
   const phoneMap = pickFromMap(map, 'phone', 'mobile', 'tel')
   const country = pickFromMap(map, 'country')
@@ -319,7 +341,7 @@ function mergeFields(
     guestName: guestName ?? null,
     reservationNumber: r,
     status: (status ?? blob.status ?? '').trim() || null,
-    roomNumber: (room ?? blob.roomNumber ?? '').trim() || null,
+    roomNumber: (roomLine ?? room ?? blob.roomNumber ?? '').trim() || null,
     arrivalDateRaw: (arr ?? blob.arrivalDateRaw ?? '').trim() || null,
     departureDateRaw: (dep ?? blob.departureDateRaw ?? '').trim() || null,
     email: email || null,
@@ -393,6 +415,18 @@ export function findOpenEzeeDrawerRoot(doc: Document): HTMLElement | null {
       return el
     }
   }
+
+  // Some Unity builds keep the drawer mounted without ant-drawer-open briefly;
+  // accept a visible right drawer that contains reservation fields.
+  for (const el of doc.querySelectorAll<HTMLElement>('.ant-drawer-content-wrapper, .ant-drawer-content')) {
+    const style = window.getComputedStyle(el)
+    if (style.visibility === 'hidden' || style.display === 'none') continue
+    const text = (el.innerText ?? '').slice(0, 4000)
+    if (/Reservation\s*Number/i.test(text) && /\bRoom\s*Number\b/i.test(text)) {
+      return el.closest<HTMLElement>('.ant-drawer') ?? el
+    }
+  }
+
   return null
 }
 
@@ -517,16 +551,13 @@ export function isEzeeFolioContext(doc: Document): boolean {
   return isEzeeFolioOperationsTabActive(doc) || isEzeeFolioLedgerMainView(doc)
 }
 
-/** Enough fields for a real guest load (blocks name-only / folio partial scrapes). */
+/**
+ * Enough fields for a real guest load (blocks name-only / folio partial scrapes).
+ * A valid reservation / booking number alone is enough — the service worker fills
+ * room + checkout via `ezee-reservation-detail` when scrape is thin (Stayover).
+ */
 export function isCompleteEzeeGuestScrape(fields: EzeeScrapeFields): boolean {
-  if (!isValidEzeeReservationNumber(fields.reservationNumber)) return false
-  const hasContact = !!(fields.phone?.trim() || fields.email?.trim())
-  const hasStay = !!(
-    fields.roomNumber?.trim() ||
-    fields.arrivalDateRaw?.trim() ||
-    fields.departureDateRaw?.trim()
-  )
-  return hasContact || hasStay
+  return isValidEzeeReservationNumber(fields.reservationNumber)
 }
 
 /**

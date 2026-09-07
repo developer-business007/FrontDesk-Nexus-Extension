@@ -1069,15 +1069,15 @@ async function completeEzeeReservationFromSnapshot(
       ? members[ezeeGroupActiveIndex]?.confirmationNumber?.trim()
       : snapshot.confirmationNumber?.trim()
 
-  if (activeBookingId && ezeeGroupBaseSnapshot && ezeeGroupBaseDisplay) {
+  // Always enrich from eZee reservation-detail when we have a booking ID.
+  // DOM scrape alone often misses room/checkout on Stayover / in-house panels;
+  // encode UI requires roomNumber — API is the reliable fill.
+  if (activeBookingId) {
     const detail = await fetchEzeeReservationDetailFromApi(activeBookingId)
     if (detail) {
-      await applyEzeeReservationDetailToLoadedGuest(
-        detail,
-        ezeeGroupBaseSnapshot,
-        ezeeGroupBaseDisplay,
-        tabUrl,
-      )
+      const baseSnap = ezeeGroupBaseSnapshot ?? reservation!
+      const baseDisp = ezeeGroupBaseDisplay ?? ezeeGuestDisplay!
+      await applyEzeeReservationDetailToLoadedGuest(detail, baseSnap, baseDisp, tabUrl)
       if (members.length > 1) {
         ezeeGroupMembers[ezeeGroupActiveIndex] = memberFromEzeeReservationDetail(
           ezeeGroupMembers[ezeeGroupActiveIndex],
@@ -1086,10 +1086,14 @@ async function completeEzeeReservationFromSnapshot(
       }
     } else {
       await applyEzeeBillingToLoadedGuest(activeBookingId)
+      if (!reservation?.roomNumber?.trim()) {
+        console.warn(
+          '[FDN SW] eZee stay loaded without room — encode disabled until Refresh stay gets room from PMS/API',
+          { bookingId: activeBookingId },
+        )
+      }
     }
     if (members.length > 1) void enrichEzeeGroupMembersFromApi()
-  } else if (snapshot.confirmationNumber?.trim()) {
-    await applyEzeeBillingToLoadedGuest(snapshot.confirmationNumber.trim())
   }
 
   void chrome.storage.local.set({
@@ -3820,15 +3824,9 @@ async function handleMessage(
       return { ok: false, error: 'eZee auto-load: no sender tab' }
     }
     const c = (msg.snapshot.confirmationNumber ?? '').trim()
+    // Booking # alone is enough — room/checkout filled via ezee-reservation-detail.
     if (!isValidEzeeReservationNumber(c)) {
       console.warn('[FDN] eZee auto-load: invalid reservation #, ignored', msg.snapshot.confirmationNumber)
-      return { ok: true, state: await getState() }
-    }
-    const g = msg.guestDisplay
-    const hasContact = !!(g.phone?.trim() || g.email?.trim())
-    const hasStay = !!(g.roomNumber?.trim() || g.staySummary?.trim())
-    if (!hasContact && !hasStay) {
-      console.warn('[FDN] eZee auto-load: incomplete guest payload, ignored', c, g.nameLine)
       return { ok: true, state: await getState() }
     }
 

@@ -506,6 +506,27 @@ function App() {
     if (state?.reservation?.roomNumber) setActiveTab('key')
   }, [state?.reservation?.confirmationNumber, state?.reservation?.roomNumber])
 
+  // Re-check RFID when Encode tab opens — status goes stale after SW startup handshake only.
+  useEffect(() => {
+    if (activeTab !== 'key' || !state?.auth.signedIn) return
+    let cancelled = false
+    void (async () => {
+      try {
+        const resp = (await chrome.runtime.sendMessage({
+          type: 'RFID_CHECK_CONNECTION',
+        })) as ExtensionResponse
+        if (!cancelled && resp?.ok && 'state' in resp && resp.state) {
+          setState(resp.state)
+        }
+      } catch {
+        /* ignore */
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [activeTab, state?.auth.signedIn])
+
   useEffect(() => {
     if (activeTab !== 'id') return
     idPanelRef.current?.scrollTo({ top: 0 })
@@ -2904,11 +2925,19 @@ function App() {
             : 'Could not read guest from the PMS tab. Open the guest drawer and try again.'
         setKeyNotice(errMsg)
       } else {
+        const room = resp.state?.reservation?.roomNumber?.trim()
         void refreshKeyHistory()
-        showChromeNotification(
-          'FrontDesk Nexus',
-          'Stay details refreshed from PMS — you can encode keys when room and checkout are shown.',
-        )
+        if (!room) {
+          setKeyNotice(
+            'Stay loaded but room is missing — open Guest Details / Booking Details (not Folio), then Refresh stay again.',
+          )
+        } else {
+          setKeyNotice(null)
+          showChromeNotification(
+            'FrontDesk Nexus',
+            `Stay ready — Rm ${room}. You can encode keys.`,
+          )
+        }
       }
     } finally {
       setPmsRefreshBusy(false)
@@ -4102,7 +4131,9 @@ function App() {
 
               {!res?.roomNumber ? (
                 <p className="fdn-muted" style={{ marginTop: 12 }}>
-                  Load a reservation first to enable key encoding.
+                  {res?.confirmationNumber
+                    ? 'Stay loaded but room is missing — tap Refresh stay (open Guest Details / Booking Details, not Folio).'
+                    : 'Load a reservation first to enable key encoding.'}
                 </p>
               ) : (
                 <>
