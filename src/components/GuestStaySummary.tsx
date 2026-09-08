@@ -7,6 +7,8 @@ type Props = {
   guest: SynxisGuestDisplay | null
   ezee: EzeeGuestDisplay | null
   pmsLabel: string
+  /** Hotel Settings default checkout clock (`HH:MM`) for date-only departures. */
+  defaultCheckoutTime?: string
 }
 
 function Row({ label, value }: { label: string; value: ReactNode }) {
@@ -20,7 +22,13 @@ function Row({ label, value }: { label: string; value: ReactNode }) {
 }
 
 /** Full PMS guest / stay context — shown on every workspace tab when a reservation is loaded. */
-export function GuestStaySummary({ res, guest, ezee, pmsLabel }: Props) {
+export function GuestStaySummary({
+  res,
+  guest,
+  ezee,
+  pmsLabel,
+  defaultCheckoutTime = '13:00',
+}: Props) {
   const isEzee = res.pms === 'ezee'
   const conf = res.confirmationNumber ?? ezee?.reservationNumber ?? guest?.pmsConfirmationCode ?? '—'
 
@@ -29,8 +37,8 @@ export function GuestStaySummary({ res, guest, ezee, pmsLabel }: Props) {
       ? formatHotelDateTime(res.checkInDate, 14)
       : (ezee?.staySummary?.split('→')[0]?.trim() ?? null)
   const checkOut =
-    formatHotelDateTime(res.checkOutDate, 12) !== '—'
-      ? formatHotelDateTime(res.checkOutDate, 12)
+    formatHotelDateTime(res.checkOutDate, defaultCheckoutTime) !== '—'
+      ? formatHotelDateTime(res.checkOutDate, defaultCheckoutTime)
       : (ezee?.staySummary?.split('→')[1]?.trim() ?? null)
 
   return (

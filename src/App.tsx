@@ -69,7 +69,7 @@ import {
   isCompletePhoneForLookup,
   validatePhoneNumber,
 } from './lib/phone-lookup'
-import { formatHotelDateTime } from './lib/hotel-dates'
+import { formatHotelDateTime, validateKeyValidityWindow, toSdkDatetimeHotel } from './lib/hotel-dates'
 import { GuestStaySummary } from './components/GuestStaySummary'
 import { CheckInHistoryPanel } from './components/CheckInHistoryPanel'
 import { SignaturesPdfPanel } from './components/SignaturesPdfPanel'
@@ -2629,8 +2629,14 @@ function App() {
 
   /** Encode one key (portal: IN time = encode moment; checkout from stay). */
   async function runEncodeKey(serial: number, managerPin?: string, checkinOverride?: string): Promise<boolean> {
-    if (!res?.roomNumber || !res?.checkOutDate) {
-      setKeyNotice('Load a reservation with room and check-out before encoding.')
+    if (!res?.roomNumber) {
+      setKeyNotice('Load a reservation with room before encoding — tap Refresh stay.')
+      return false
+    }
+    if (!res?.checkOutDate?.trim()) {
+      setKeyNotice(
+        'Departure / checkout is missing — refresh stay so the key does not expire overnight.',
+      )
       return false
     }
     if (serial < 1 || serial > MAX_ROOM_KEYS) {
@@ -2643,7 +2649,18 @@ function App() {
     try {
       const _now = new Date()
       const _p = (n: number) => String(n).padStart(2, '0')
-      const checkinNow = checkinOverride ?? `${_now.getFullYear()}${_p(_now.getMonth() + 1)}${_p(_now.getDate())}${_p(_now.getHours())}${_p(_now.getMinutes())}`
+      const checkinNow =
+        checkinOverride ??
+        `${_now.getFullYear()}${_p(_now.getMonth() + 1)}${_p(_now.getDate())}${_p(_now.getHours())}${_p(_now.getMinutes())}`
+      const checkoutClock = state?.defaultCheckoutTime || '13:00'
+      const checkinSdk = toSdkDatetimeHotel(checkinNow, 14)
+      const checkoutSdk = toSdkDatetimeHotel(res.checkOutDate, checkoutClock)
+      const windowErr = validateKeyValidityWindow(checkinSdk, checkoutSdk)
+      if (windowErr) {
+        setKeyNotice(windowErr)
+        return false
+      }
+
       const result = (await chrome.runtime.sendMessage({
         type: 'RFID_MAKE_KEY',
         roomNumber: res.roomNumber,
@@ -2657,6 +2674,7 @@ function App() {
         setKeyNotice('No response from native host — reload the extension and try again.')
         return false
       }
+      if (result.state) setState(result.state)
       if (!result.ok) {
         if (result.keyBlocks?.length) {
           setKeyBlocks(result.keyBlocks)
@@ -2677,14 +2695,18 @@ function App() {
       setOverridePinInput('')
       setOverridePinError(null)
 
-      const base = `Key ${serial} encoded — room ${res.roomNumber}.`
+      const untilLabel = formatHotelDateTime(res.checkOutDate, checkoutClock)
       if (result.dbWarning) {
-        setKeyNotice(`${base} Warning: ${result.dbWarning}`)
+        setKeyNotice(
+          `Key ${serial} encoded & verified — Rm ${res.roomNumber} until ${untilLabel}. Warning: ${result.dbWarning}`,
+        )
       } else if (serial >= MAX_ROOM_KEYS) {
-        setKeyNotice(`${base} Maximum keys for this stay.`)
+        setKeyNotice(
+          `Key ${serial} encoded & verified — Rm ${res.roomNumber} until ${untilLabel}. Maximum keys for this stay.`,
+        )
       } else {
         setKeyNotice(
-          `${base} Remove this card, place blank card ${serial + 1}, then press Next key.`,
+          `Key ${serial} encoded & verified — Rm ${res.roomNumber} until ${untilLabel}. Remove this card, place blank card ${serial + 1}, then press Next key.`,
         )
       }
 
@@ -2872,9 +2894,13 @@ function App() {
       setSessionCheckinTime(null)
       setSessionNextSerial(2)
       void refreshKeyHistory()
+      const untilLabel = formatHotelDateTime(
+        res.checkOutDate,
+        state?.defaultCheckoutTime || '13:00',
+      )
       const notice = result.dbWarning
-        ? `Lost key encoded. Warning: ${result.dbWarning}`
-        : `Lost key replacement ready for Room ${roomNumber}. Give card to guest — when they tap the lock, the old key is automatically deactivated.`
+        ? `Lost key encoded & verified until ${untilLabel}. Warning: ${result.dbWarning}`
+        : `Lost key replacement ready for Room ${roomNumber} until ${untilLabel}. Give card to guest — when they tap the lock, the old key is automatically deactivated.`
       setKeyNotice(notice)
     } catch (e) {
       setKeyNotice(`Lost key error — ${e instanceof Error ? e.message : 'unknown error'}`)
@@ -4059,7 +4085,13 @@ function App() {
                 </div>
               ) : null}
               {res?.confirmationNumber ? (
-                <GuestStaySummary res={res} guest={guest} ezee={ezee} pmsLabel={pmsLabel} />
+                <GuestStaySummary
+                  res={res}
+                  guest={guest}
+                  ezee={ezee}
+                  pmsLabel={pmsLabel}
+                  defaultCheckoutTime={state.defaultCheckoutTime}
+                />
               ) : (
                 <p className="fdn-stay-summary__empty">
                   Open a guest in {pmsLabel}, then tap <strong>Refresh stay</strong> if room or checkout
@@ -4115,7 +4147,12 @@ function App() {
                         <dt>Check-in</dt>
                         <dd>{formatHotelDateTime(readCardResult.checkinTime, 14)}</dd>
                         <dt>Check-out</dt>
-                        <dd>{formatHotelDateTime(readCardResult.checkoutTime, 12)}</dd>
+                        <dd>
+                          {formatHotelDateTime(
+                            readCardResult.checkoutTime,
+                            state.defaultCheckoutTime || '13:00',
+                          )}
+                        </dd>
                       </dl>
                     ) : (
                       <>
@@ -4135,8 +4172,35 @@ function App() {
                     ? 'Stay loaded but room is missing — tap Refresh stay (open Guest Details / Booking Details, not Folio).'
                     : 'Load a reservation first to enable key encoding.'}
                 </p>
+              ) : !res?.checkOutDate?.trim() ? (
+                <p className="fdn-muted" style={{ marginTop: 12 }}>
+                  Room is loaded but departure is missing — tap Refresh stay before encoding so the key
+                  does not expire overnight.
+                </p>
               ) : (
                 <>
+                  <div
+                    className="fdn-banner fdn-banner--info"
+                    style={{ marginTop: 8 }}
+                    role="status"
+                  >
+                    <p style={{ margin: 0 }}>
+                      <strong>Will encode</strong> — Rm <strong>{res.roomNumber}</strong>, valid until{' '}
+                      <strong>
+                        {formatHotelDateTime(res.checkOutDate, state.defaultCheckoutTime || '13:00')}
+                      </strong>
+                      {res.confirmationNumber ? (
+                        <>
+                          {' '}
+                          · #{res.confirmationNumber}
+                        </>
+                      ) : null}
+                    </p>
+                    <p className="fdn-help" style={{ margin: '4px 0 0' }}>
+                      Confirm departure matches the PMS before placing a card on the encoder.
+                    </p>
+                  </div>
+
                   <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 4 }}>
                     <span style={{ fontSize: 12, color: '#c9d1d9' }}>
                       Key #{sessionCheckinTime ? sessionNextSerial : 1}
@@ -4182,7 +4246,8 @@ function App() {
                       disabled={
                         keyBusy ||
                         hw.rfid_encoder !== 'connected' ||
-                        !state.auth.signedIn
+                        !state.auth.signedIn ||
+                        !res.checkOutDate?.trim()
                       }
                       onClick={() => void onMakeKey()}
                     >
@@ -4191,7 +4256,12 @@ function App() {
                     <button
                       type="button"
                       className="fdn-btn fdn-btn--danger"
-                      disabled={cancelCardBusy || hw.rfid_encoder !== 'connected' || !res?.roomNumber}
+                      disabled={
+                        cancelCardBusy ||
+                        hw.rfid_encoder !== 'connected' ||
+                        !res?.roomNumber ||
+                        !res?.checkOutDate?.trim()
+                      }
                       title="Lost key: encodes a new guest card with a fresh check-in time. When guest taps door, lock automatically invalidates the old key."
                       onClick={() => void onLostKey()}
                     >

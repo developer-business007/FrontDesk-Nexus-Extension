@@ -87,7 +87,11 @@ import { parsedFieldsFromHost } from '../nativeMessaging/scanId'
 import { idGuruDetailFromAutoScan, mergeParsedWithGuru } from '../lib/id-guru-fields'
 import { initNativeHost, sendNativeMessage, sendNativeRequest } from '../nativeHost'
 import { checkMinExtensionVersion } from '../lib/version-check'
-import { toSdkDatetimeHotel } from '../lib/hotel-dates'
+import {
+  toSdkDatetimeHotel,
+  validateKeyValidityWindow,
+  verifyEncodedCardMatches,
+} from '../lib/hotel-dates'
 import { logSynxisGuestSpecConsole, parseSynxisReservationSummaryResponse } from '../lib/synxis-guest-summary'
 import { isSynxisConfirmationToken } from '../lib/synxis-confirmation-dom'
 import {
@@ -253,12 +257,16 @@ const SYNXIS_DEFAULT_GUEST_ID = 100
  * `key_history` text times: keep the same 12-char SDK form as the encoder (`YYYYMMDDHHmm`),
  * matching legacy PMS-synced rows. Falls back to `toSdkDatetimeHotel` when Python omits a value.
  */
-function keyHistoryTimeForDb(rawSdk: unknown, fallbackMsg: string, defaultHour: number): string {
+function keyHistoryTimeForDb(
+  rawSdk: unknown,
+  fallbackMsg: string,
+  defaultClock: number | string,
+): string {
   if (typeof rawSdk === 'string') {
     const t = rawSdk.trim()
     if (/^\d{12}$/.test(t)) return t
   }
-  return toSdkDatetimeHotel(fallbackMsg, defaultHour)
+  return toSdkDatetimeHotel(fallbackMsg, defaultClock)
 }
 
 /** Resolve guest_profile_id for a confirmation number so key_history rows are linked to the guest. */
@@ -303,6 +311,53 @@ async function runRfidMakeKey(msg: RfidMakeKeyMessage): Promise<ExtensionRespons
 
   // ── Key-making gates (check-in status + balance) ──────────────────────────
   const settings = await loadExtensionHotelSettings(client)
+  const checkoutClock = settings.defaultCheckoutTime || '13:00'
+
+  // Fresh eZee departure/room before encode — prevents overnight-expire cards from thin scrape.
+  let roomNumber = msg.roomNumber.trim()
+  let checkoutTime = msg.checkoutTime
+  let checkinTime = msg.checkinTime
+  const bookingId =
+    msg.confirmationNumber?.trim() || reservation?.confirmationNumber?.trim() || ''
+  if (reservation?.pms === 'ezee' && bookingId) {
+    const detail = await fetchEzeeReservationDetailFromApi(bookingId)
+    if (detail) {
+      if (detail.roomNumber?.trim()) roomNumber = detail.roomNumber.trim()
+      if (detail.checkOutDate?.trim()) checkoutTime = detail.checkOutDate.trim()
+      if (detail.checkInDate?.trim() && !/^\d{12}$/.test(checkinTime.trim())) {
+        // Keep encode-moment check-in for primary keys; only fill if caller sent a stay date.
+      }
+      if (ezeeGuestDisplay) {
+        ezeeGuestDisplay = displayFromEzeeReservationDetail(ezeeGuestDisplay, detail)
+      }
+      if (reservation) {
+        reservation = reservationFromEzeeReservationDetail(
+          reservation,
+          detail,
+          reservation.pageUrl,
+          new Date().toISOString(),
+        )
+      }
+    }
+  }
+
+  if (!roomNumber) {
+    return { ok: false, error: 'Room number is required — refresh stay from PMS before encoding.' }
+  }
+  if (!checkoutTime?.trim()) {
+    return {
+      ok: false,
+      error:
+        'Departure / checkout is missing — refresh stay from PMS so the key does not expire overnight.',
+    }
+  }
+
+  const checkinSdk = toSdkDatetimeHotel(checkinTime, 14)
+  const checkoutSdk = toSdkDatetimeHotel(checkoutTime, checkoutClock)
+  const windowErr = validateKeyValidityWindow(checkinSdk, checkoutSdk)
+  if (windowErr) {
+    return { ok: false, error: windowErr }
+  }
 
   const isOverride =
     typeof msg.managerPin === 'string' &&
@@ -365,9 +420,9 @@ async function runRfidMakeKey(msg: RfidMakeKeyMessage): Promise<ExtensionRespons
   try {
     const raw = await sendNativeRequest({
       type: 'RFID_MAKE_KEY',
-      room_number: msg.roomNumber,
-      checkin_time: toSdkDatetimeHotel(msg.checkinTime, 14),
-      checkout_time: toSdkDatetimeHotel(msg.checkoutTime, 12),
+      room_number: roomNumber,
+      checkin_time: checkinSdk,
+      checkout_time: checkoutSdk,
       card_serial: msg.cardSerial ?? 1,
     })
 
@@ -375,16 +430,31 @@ async function runRfidMakeKey(msg: RfidMakeKeyMessage): Promise<ExtensionRespons
       return { ok: false, error: String(raw.error ?? 'Key encoding failed') }
     }
 
+    const verifyErr = verifyEncodedCardMatches(
+      typeof raw.encoded_data === 'string' ? raw.encoded_data : null,
+      roomNumber,
+      checkoutSdk,
+    )
+    if (verifyErr) {
+      console.error('[FDN SW] key encode verify failed', verifyErr, {
+        room: roomNumber,
+        checkoutSdk,
+        encodedPreview:
+          typeof raw.encoded_data === 'string' ? raw.encoded_data.slice(0, 48) : null,
+      })
+      return { ok: false, error: verifyErr }
+    }
+
     const { data: sess } = await client.auth.getSession()
     const user = sess.session?.user ?? null
     const terminalId = await ensureTerminal(client)
     const confFromMsg = msg.confirmationNumber?.trim() || null
     const confFromPms = reservation?.confirmationNumber ?? null
-    const conf = confFromMsg || confFromPms
+    const conf = confFromMsg || confFromPms || bookingId || null
     let dbWarning: string | null = null
 
-    const dbCheckinTime = keyHistoryTimeForDb(raw.checkin_time, msg.checkinTime, 14)
-    const dbCheckoutTime = keyHistoryTimeForDb(raw.checkout_time, msg.checkoutTime, 12)
+    const dbCheckinTime = keyHistoryTimeForDb(raw.checkin_time, checkinSdk, 14)
+    const dbCheckoutTime = keyHistoryTimeForDb(raw.checkout_time, checkoutSdk, checkoutClock)
 
     if (user && conf) {
       const adminPortal = Boolean(msg.portalAdminEncode)
@@ -393,7 +463,7 @@ async function runRfidMakeKey(msg: RfidMakeKeyMessage): Promise<ExtensionRespons
 
       const insertRow: Record<string, unknown> = {
         confirmation_number: conf,
-        room_number: msg.roomNumber,
+        room_number: roomNumber,
         card_serial: msg.cardSerial ?? 1,
         checkin_time: dbCheckinTime,
         checkout_time: dbCheckoutTime,
@@ -411,10 +481,10 @@ async function runRfidMakeKey(msg: RfidMakeKeyMessage): Promise<ExtensionRespons
       }
 
       const auditDescription = adminPortal
-        ? `Portal admin room key encoded — room ${msg.roomNumber}, serial ${msg.cardSerial ?? 1}`
+        ? `Portal admin room key encoded — room ${roomNumber}, serial ${msg.cardSerial ?? 1}`
         : isOverride
-          ? `Manager override: key encoded — room ${msg.roomNumber}, serial ${msg.cardSerial ?? 1}`
-          : `Room key encoded — room ${msg.roomNumber}, serial ${msg.cardSerial ?? 1}`
+          ? `Manager override: key encoded — room ${roomNumber}, serial ${msg.cardSerial ?? 1}`
+          : `Room key encoded — room ${roomNumber}, serial ${msg.cardSerial ?? 1}`
 
       await client
         .from('audit_log')
@@ -427,11 +497,14 @@ async function runRfidMakeKey(msg: RfidMakeKeyMessage): Promise<ExtensionRespons
           confirmation_number: conf,
           description: auditDescription,
           new_value: {
-            room_number: msg.roomNumber,
+            room_number: roomNumber,
             card_serial: msg.cardSerial ?? 1,
+            checkin_time: dbCheckinTime,
+            checkout_time: dbCheckoutTime,
             return_msg: raw.return_msg,
             portal_admin: adminPortal,
             manager_override: isOverride,
+            verified: true,
           },
         })
         .then(({ error }) => {
@@ -449,7 +522,7 @@ async function runRfidMakeKey(msg: RfidMakeKeyMessage): Promise<ExtensionRespons
         type: 'basic',
         iconUrl: 'icon.png',
         title: 'Key Encoded — DB Warning',
-        message: `${serialLabel} — Room ${msg.roomNumber}\n${dbWarning}`,
+        message: `${serialLabel} — Room ${roomNumber}\nUntil ${dbCheckoutTime}\n${dbWarning}`,
         priority: 2,
       })
     } else {
@@ -457,14 +530,14 @@ async function runRfidMakeKey(msg: RfidMakeKeyMessage): Promise<ExtensionRespons
         type: 'basic',
         iconUrl: 'icon.png',
         title: 'Key Card Encoded',
-        message: `${serialLabel} — Room ${msg.roomNumber}\nConf: ${conf ?? '—'}`,
+        message: `${serialLabel} — Room ${roomNumber}\nValid until ${dbCheckoutTime}\nConf: ${conf ?? '—'}`,
         priority: 1,
       })
     }
 
     if (typeof raw.encoded_data === 'string' && raw.encoded_data) {
       const entry = {
-        roomNumber: msg.roomNumber,
+        roomNumber,
         cardSerial: msg.cardSerial ?? 1,
         checkinTime: dbCheckinTime,
         checkoutTime: dbCheckoutTime,
@@ -4282,15 +4355,45 @@ async function handleMessage(
 
   if (msg.type === 'RFID_MAKE_LOST_KEY') {
     const client = getClient()
+    const settings = await loadExtensionHotelSettings(client)
+    const checkoutClock = settings.defaultCheckoutTime || '13:00'
     try {
+      let roomNumber = msg.roomNumber.trim()
+      let checkoutTime = msg.checkoutTime
+      const bookingId = reservation?.confirmationNumber?.trim() || ''
+      if (reservation?.pms === 'ezee' && bookingId) {
+        const detail = await fetchEzeeReservationDetailFromApi(bookingId)
+        if (detail?.roomNumber?.trim()) roomNumber = detail.roomNumber.trim()
+        if (detail?.checkOutDate?.trim()) checkoutTime = detail.checkOutDate.trim()
+      }
+      if (!checkoutTime?.trim()) {
+        return {
+          ok: false,
+          error: 'Departure / checkout is missing — refresh stay before encoding a lost key.',
+        }
+      }
+      const checkoutSdk = toSdkDatetimeHotel(checkoutTime, checkoutClock)
+      if (!/^\d{12}$/.test(checkoutSdk)) {
+        return { ok: false, error: 'Invalid checkout time — refresh stay and try again.' }
+      }
+
       const raw = await sendNativeRequest({
         type: 'RFID_MAKE_LOST_KEY',
-        room_number: msg.roomNumber,
-        checkout_time: toSdkDatetimeHotel(msg.checkoutTime, 12),
+        room_number: roomNumber,
+        checkout_time: checkoutSdk,
       })
 
       if (!raw.success) {
         return { ok: false, error: String(raw.error ?? 'Lost key encoding failed') }
+      }
+
+      const verifyErr = verifyEncodedCardMatches(
+        typeof raw.encoded_data === 'string' ? raw.encoded_data : null,
+        roomNumber,
+        checkoutSdk,
+      )
+      if (verifyErr) {
+        return { ok: false, error: verifyErr }
       }
 
       const { data: sess } = await client.auth.getSession()
@@ -4300,13 +4403,13 @@ async function handleMessage(
       let dbWarning: string | null = null
 
       const newCheckinTime = typeof raw.new_checkin_time === 'string' ? raw.new_checkin_time : String(raw.new_checkin_time ?? '')
-      const dbCheckoutTime = keyHistoryTimeForDb(raw.checkout_time, msg.checkoutTime, 12)
+      const dbCheckoutTime = keyHistoryTimeForDb(raw.checkout_time, checkoutSdk, checkoutClock)
 
       if (user && conf) {
         const guestProfileId = await resolveGuestProfileId(client, conf)
         const { error: khErr } = await client.from('key_history').insert({
           confirmation_number: conf,
-          room_number: msg.roomNumber,
+          room_number: roomNumber,
           card_serial: 1,
           checkin_time: newCheckinTime,
           checkout_time: dbCheckoutTime,
@@ -4329,8 +4432,15 @@ async function handleMessage(
             terminal_id: terminalId,
             action_type: 'KEY_ENCODED',
             confirmation_number: conf,
-            description: `Lost key replacement encoded — room ${msg.roomNumber}, serial 1`,
-            new_value: { room_number: msg.roomNumber, card_serial: 1, return_msg: raw.return_msg, lost_key_replacement: true },
+            description: `Lost key replacement encoded — room ${roomNumber}, serial 1`,
+            new_value: {
+              room_number: roomNumber,
+              card_serial: 1,
+              return_msg: raw.return_msg,
+              lost_key_replacement: true,
+              checkout_time: dbCheckoutTime,
+              verified: true,
+            },
           })
           .then(({ error }) => {
             if (error) console.error('[FDN SW] audit_log (lost_key) failed:', error.message)
@@ -4346,7 +4456,7 @@ async function handleMessage(
           type: 'basic',
           iconUrl: 'icon.png',
           title: 'Lost Key Encoded — DB Warning',
-          message: `Room ${msg.roomNumber}\n${dbWarning}`,
+          message: `Room ${roomNumber}\nUntil ${dbCheckoutTime}\n${dbWarning}`,
           priority: 2,
         })
       } else {
@@ -4354,7 +4464,7 @@ async function handleMessage(
           type: 'basic',
           iconUrl: 'icon.png',
           title: 'Lost Key Replacement Encoded',
-          message: `Room ${msg.roomNumber} — tap door to invalidate old key. Conf: ${conf ?? '—'}`,
+          message: `Room ${roomNumber} — valid until ${dbCheckoutTime}. Tap door to invalidate old key. Conf: ${conf ?? '—'}`,
           priority: 1,
         })
       }

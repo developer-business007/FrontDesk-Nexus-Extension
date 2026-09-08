@@ -71,6 +71,24 @@ function pad2(n: number): string {
   return String(n).padStart(2, '0')
 }
 
+/** Hotel settings `HH:MM` or legacy hour number → clock components. */
+export function resolveDefaultClock(defaultClock: number | string): { hour: number; minute: number } {
+  if (typeof defaultClock === 'string') {
+    const m = defaultClock.trim().match(/^(\d{1,2}):(\d{2})$/)
+    if (m) {
+      return {
+        hour: Math.max(0, Math.min(23, Number.parseInt(m[1]!, 10))),
+        minute: Math.max(0, Math.min(59, Number.parseInt(m[2]!, 10))),
+      }
+    }
+    return { hour: 13, minute: 0 }
+  }
+  if (typeof defaultClock === 'number' && Number.isFinite(defaultClock)) {
+    return { hour: Math.max(0, Math.min(23, Math.floor(defaultClock))), minute: 0 }
+  }
+  return { hour: 13, minute: 0 }
+}
+
 /** Format a local calendar `YYYY-MM-DD` for display (no UTC shift). */
 export function formatCalendarDate(isoDate: string): string {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoDate.trim())
@@ -86,14 +104,18 @@ export function formatCalendarDate(isoDate: string): string {
 
 /**
  * Normalise check-in/out to SDK `yyyyMMddHHmm`.
- * UTC midnight ISO → hotel calendar date + `defaultHour` (local wall clock).
+ * UTC midnight ISO → hotel calendar date + default clock (local wall clock).
  * Local datetime with an explicit time (e.g. `2026-06-02T08:28:00`, no Z, not midnight)
- * is used as-is — `defaultHour` is NOT applied.
+ * is used as-is — default clock is NOT applied.
+ *
+ * @param defaultClock hour `14` or Settings `HH:MM` like `13:00`
  */
-export function toSdkDatetimeHotel(s: string, defaultHour: number): string {
+export function toSdkDatetimeHotel(s: string, defaultClock: number | string): string {
   const t = s.trim()
   if (!t) return t
   if (/^\d{12}$/.test(t)) return t
+
+  const { hour, minute } = resolveDefaultClock(defaultClock)
 
   // Local ISO datetime with a real time component — preserve it exactly
   const localDt = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(t)
@@ -104,14 +126,14 @@ export function toSdkDatetimeHotel(s: string, defaultHour: number): string {
   const normalized = normalizeHotelStayDate(null, t)
   if (normalized) {
     const [y, mo, d] = normalized.split('-').map(Number)
-    const date = new Date(y, mo - 1, d, defaultHour, 0, 0, 0)
+    const date = new Date(y!, mo! - 1, d!, hour, minute, 0, 0)
     return `${date.getFullYear()}${pad2(date.getMonth() + 1)}${pad2(date.getDate())}${pad2(date.getHours())}${pad2(date.getMinutes())}`
   }
 
   const cal = calendarDateFromUtcIso(t) ?? (/^\d{4}-\d{2}-\d{2}$/.test(t) ? t : null)
   if (cal && (t.endsWith('Z') || /T00:00:00/.test(t) || t === cal)) {
     const [y, mo, d] = cal.split('-').map(Number)
-    const date = new Date(y, mo - 1, d, defaultHour, 0, 0, 0)
+    const date = new Date(y!, mo! - 1, d!, hour, minute, 0, 0)
     return `${date.getFullYear()}${pad2(date.getMonth() + 1)}${pad2(date.getDate())}${pad2(date.getHours())}${pad2(date.getMinutes())}`
   }
 
@@ -119,37 +141,164 @@ export function toSdkDatetimeHotel(s: string, defaultHour: number): string {
   return t
 }
 
+/** Parse SDK `yyyyMMddHHmm` to a local Date. */
+export function parseSdkDatetime(sdk: string): Date | null {
+  const t = sdk.trim()
+  if (!/^\d{12}$/.test(t)) return null
+  const d = new Date(
+    Number(t.slice(0, 4)),
+    Number(t.slice(4, 6)) - 1,
+    Number(t.slice(6, 8)),
+    Number(t.slice(8, 10)),
+    Number(t.slice(10, 12)),
+    0,
+    0,
+  )
+  return Number.isNaN(d.getTime()) ? null : d
+}
+
+/**
+ * Returns an error message when the key validity window is invalid for door locks.
+ * Checkout must be strictly after check-in (not same minute / not earlier).
+ */
+export function validateKeyValidityWindow(
+  checkinSdk: string,
+  checkoutSdk: string,
+): string | null {
+  if (!/^\d{12}$/.test(checkinSdk.trim())) {
+    return 'Invalid check-in time for key encoding — refresh stay and try again.'
+  }
+  if (!/^\d{12}$/.test(checkoutSdk.trim())) {
+    return 'Missing or invalid checkout / departure — refresh stay so departure date loads before encoding.'
+  }
+  const ci = parseSdkDatetime(checkinSdk)
+  const co = parseSdkDatetime(checkoutSdk)
+  if (!ci || !co) {
+    return 'Could not parse key check-in/out times — refresh stay and try again.'
+  }
+  if (co.getTime() <= ci.getTime()) {
+    return (
+      'Checkout must be after check-in — departure on the card would expire immediately. ' +
+      'Refresh stay from PMS and confirm departure date before encoding.'
+    )
+  }
+  // Guard against accidental same-day noon when guest is multi-night (soft: only if checkout is within 2h of checkin)
+  const hours = (co.getTime() - ci.getTime()) / 3_600_000
+  if (hours < 1) {
+    return (
+      'Key validity window is under 1 hour — departure looks wrong. ' +
+      'Refresh stay and confirm the guest departure date before encoding.'
+    )
+  }
+  return null
+}
+
+/** Normalize room numbers for compare (`0230` / `230`). */
+export function normalizeRoomNumberForCompare(room: string | null | undefined): string {
+  const t = (room ?? '').trim()
+  if (!t) return ''
+  const digits = t.replace(/\D/g, '')
+  if (!digits) return t.toLowerCase()
+  return String(Number.parseInt(digits, 10))
+}
+
+/**
+ * Parse Elox ReadCardCK / encoded_data string (same layout as Python `_parse_card_data`).
+ */
+export function parseEloxEncodedCard(raw: string): {
+  roomNumber: string
+  cardSerial: number
+  checkinTime: string
+  checkoutTime: string
+} | null {
+  if (raw.length < 47) return null
+  try {
+    const roomSdk = raw.slice(6, 14)
+    const serial = raw.slice(14, 15)
+    const checkin = raw.slice(15, 27)
+    const coRaw = raw.slice(27, 39)
+    const roomNumber = roomSdk.slice(0, 6).replace(/^0+/, '') || '0'
+    if (!/^\d+$/.test(roomNumber) || !/^\d{12}$/.test(checkin) || !/^\d{12}$/.test(coRaw)) return null
+
+    const mmInt = Number.parseInt(coRaw.slice(4, 6), 10)
+    let checkout = coRaw
+    if (mmInt > 12) {
+      const month = Number.parseInt(coRaw[5]!, 10)
+      checkout = `${coRaw.slice(0, 4)}${pad2(month)}${coRaw.slice(6)}`
+    }
+
+    return {
+      roomNumber,
+      cardSerial: /^\d$/.test(serial) ? Number.parseInt(serial, 10) : 1,
+      checkinTime: checkin,
+      checkoutTime: checkout,
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * After MakeCard, ensure the written card matches intended room + checkout calendar day.
+ */
+export function verifyEncodedCardMatches(
+  encodedData: string | null | undefined,
+  expectedRoom: string,
+  expectedCheckoutSdk: string,
+): string | null {
+  if (!encodedData?.trim()) {
+    return 'Key write could not be verified (empty card data) — leave the card on the encoder and try again.'
+  }
+  const parsed = parseEloxEncodedCard(encodedData.trim())
+  if (!parsed) {
+    return 'Key write verification failed — card data could not be read. Re-encode with the card flat on the encoder.'
+  }
+  if (normalizeRoomNumberForCompare(parsed.roomNumber) !== normalizeRoomNumberForCompare(expectedRoom)) {
+    return (
+      `Card verification failed — wrote room ${expectedRoom} but card reads room ${parsed.roomNumber}. ` +
+      'Re-encode with a blank card.'
+    )
+  }
+  const wantDay = expectedCheckoutSdk.trim().slice(0, 8)
+  const gotDay = parsed.checkoutTime.slice(0, 8)
+  if (wantDay && gotDay && wantDay !== gotDay) {
+    return (
+      `Card verification failed — checkout date on card (${gotDay}) does not match stay departure (${wantDay}). ` +
+      'Refresh stay and re-encode so the key does not expire overnight.'
+    )
+  }
+  return null
+}
+
 function formatLocalDateTime(d: Date): string {
   return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
 }
 
 /** Date-only stay boundary → local wall time for display (matches encoder defaults). */
-function formatCalendarDateWithHour(isoDate: string, hour: number): string {
+function formatCalendarDateWithClock(isoDate: string, defaultClock: number | string): string {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoDate.trim())
   if (!m) return isoDate
-  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), hour, 0, 0, 0)
+  const { hour, minute } = resolveDefaultClock(defaultClock)
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), hour, minute, 0, 0)
   if (Number.isNaN(d.getTime())) return isoDate
   return formatLocalDateTime(d)
 }
 
 /**
  * Human-readable check-in/out for UI (ISO, SDK 12-char, or free text).
- * Date-only values use `defaultHour` (check-in 14:00, check-out 12:00) so format matches timed strings.
- * Local datetime with an explicit time is displayed as-is — `defaultHour` is NOT applied.
+ * Date-only values use `defaultClock` (hour or `HH:MM`) so format matches timed strings.
  */
 export function formatHotelDateTime(
   s: string | null | undefined,
-  defaultHour: number = 12,
+  defaultClock: number | string = 12,
 ): string {
   if (!s?.trim()) return '—'
   const t = s.trim()
   if (/^\d{12}$/.test(t)) {
-    const d = new Date(
-      `${t.slice(0, 4)}-${t.slice(4, 6)}-${t.slice(6, 8)}T${t.slice(8, 10)}:${t.slice(10, 12)}:00`,
-    )
-    if (!Number.isNaN(d.getTime())) return formatLocalDateTime(d)
+    const d = parseSdkDatetime(t)
+    if (d) return formatLocalDateTime(d)
   }
-  // Local ISO datetime with a real time component — display as-is, ignore defaultHour
+  // Local ISO datetime with a real time component — display as-is, ignore defaultClock
   const localDt = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(t)
   if (localDt && !t.endsWith('Z') && !/T00:00:00/.test(t)) {
     const [, y, mo, d, h, min] = localDt
@@ -158,12 +307,12 @@ export function formatHotelDateTime(
   }
   const normalized = normalizeHotelStayDate(null, t)
   if (normalized) {
-    return formatCalendarDateWithHour(normalized, defaultHour)
+    return formatCalendarDateWithClock(normalized, defaultClock)
   }
 
   const cal = calendarDateFromUtcIso(t) ?? (/^\d{4}-\d{2}-\d{2}$/.test(t) ? t : null)
   if (cal && (t.endsWith('Z') || /T00:00:00/.test(t) || t === cal)) {
-    return formatCalendarDateWithHour(cal, defaultHour)
+    return formatCalendarDateWithClock(cal, defaultClock)
   }
 
   return t
