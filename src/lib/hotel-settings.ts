@@ -56,7 +56,7 @@ export const DEFAULT_EXTENSION_HOTEL_SETTINGS: ExtensionHotelSettings = {
   hotelPhone: '',
   hotelEmail: '',
   cashDepositAmount: 100,
-  defaultCheckoutTime: '11:00',
+  defaultCheckoutTime: '13:00',
   frontDeskKeysWriteAccessUntil: null,
   frontDeskDefaultKeyDays: 1,
   frontDeskDefaultKeyDaysEnabled: true,
