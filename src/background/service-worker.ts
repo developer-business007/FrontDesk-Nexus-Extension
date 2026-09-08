@@ -1545,10 +1545,13 @@ async function upsertReservationSnapshot(
 
 async function refreshHardwareCache(): Promise<void> {
   try {
+    await hydrateScannerSelectionFromStorage()
     const connected = await pingNativeHost()
     cachedIdScanner = connected ? 'connected' : 'disconnected'
     idScannerStatusCheckedAt = Date.now()
     if (connected) {
+      // Keep host Auto/Manual + active scanner in sync after MV3 SW sleeps/restarts.
+      void syncActiveScannerToHost(selectedScanner)
       try {
         const statusResp = await sendNativeRequest({ type: 'DEVICE_STATUS' }, 10_000)
         if (Array.isArray(statusResp?.twain_sources)) {
@@ -1657,6 +1660,17 @@ async function syncNscan690gtScanModeToHost(mode: 'auto' | 'manual'): Promise<vo
     await sendNativeRequest({ type: 'SET_NSCAN690GT_SCAN_MODE', mode }, 8_000)
   } catch (e) {
     console.warn('[FDN nScan690gt] failed to sync scan mode to host:', e)
+  }
+}
+
+/** MV3 SW restarts wipe in-memory defaults (thales/manual). Always re-read before using them. */
+async function hydrateScannerSelectionFromStorage(): Promise<void> {
+  const stored = await chrome.storage.local.get(['fdn_selected_scanner', 'fdn_nscan690gt_scan_mode'])
+  if (stored.fdn_selected_scanner === 'thales' || stored.fdn_selected_scanner === 'twain') {
+    selectedScanner = stored.fdn_selected_scanner
+  }
+  if (stored.fdn_nscan690gt_scan_mode === 'auto' || stored.fdn_nscan690gt_scan_mode === 'manual') {
+    nscan690gtScanMode = stored.fdn_nscan690gt_scan_mode
   }
 }
 
@@ -2875,11 +2889,17 @@ async function broadcastNativeIdScan(payload: Omit<NativeIdScanBroadcast, 'type'
 }
 
 async function handleThalesNativeScan(payload: NativeScanSuccessPayload) {
-  if (
-    payload.scanSource === 'nscan690gt_auto_watch' &&
-    (selectedScanner !== 'twain' || nscan690gtScanMode !== 'auto')
-  ) {
-    console.info('[FDN nScan690gt] ignored auto scan — Manual mode or Thales selected')
+  // SW memory defaults to thales/manual after every restart — hydrate before filtering.
+  await hydrateScannerSelectionFromStorage()
+
+  // Host only pushes nscan690gt_auto_watch while Auto watch is running. If 690gt is the
+  // selected scanner, always apply — do not also require in-memory mode==='auto' (stale
+  // after MV3 wake caused successful host pushes to be silently dropped).
+  if (payload.scanSource === 'nscan690gt_auto_watch' && selectedScanner !== 'twain') {
+    console.info(
+      '[FDN nScan690gt] ignored auto scan — selectedScanner=%s (need twain/690gt)',
+      selectedScanner,
+    )
     return
   }
   if (payload.scanSource === 'thales_auto_watch' && selectedScanner !== 'thales') {
@@ -4738,6 +4758,9 @@ void initNativeHost(
     })
   },
 )
+
+// Hydrate scanner prefs immediately — do not wait for first GET_STATE / native reconnect.
+void restorePersistedReservationState()
 
 // Proactively refresh scanner connection status every 10 s so the side panel
 // always shows current state without any manual action.
