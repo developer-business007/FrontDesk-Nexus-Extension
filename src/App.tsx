@@ -4006,7 +4006,11 @@ function App() {
           ) : null}
 
           {activeTab === 'dualpms' ? (
-            <DualPmsPanel signedIn={state.auth.signedIn} />
+            <DualPmsPanel
+              signedIn={state.auth.signedIn}
+              encoderConnected={hw.rfid_encoder === 'connected'}
+              userRole={state.auth.role}
+            />
           ) : null}
 
           {activeTab === 'keys' ? (

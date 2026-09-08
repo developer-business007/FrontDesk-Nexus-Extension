@@ -28,6 +28,8 @@ import {
   syncAgeClass,
   synxisOccBadgeClass,
 } from '../lib/pms-board-display'
+import { isDualPmsCheckedIn, stripEzeeOccupancyLabel } from '../lib/pms-room-status'
+import { normalizeHotelStayDate } from '../lib/hotel-dates'
 
 const PMS_SYNC_INTERVAL_MS = 10_000
 
@@ -91,7 +93,7 @@ function matchesFilter(row: PmsBoardRow, f: FilterState): boolean {
     if (!sOccOk) return false
   }
 
-  const eOcc = row.ezee_occupancy
+  const eOcc = stripEzeeOccupancyLabel(row.ezee_occupancy)
   if (eOcc && !f.ezee_occ.includes(eOcc)) return false
 
   if (row.sold_by && !f.sold_by.includes(row.sold_by)) return false
@@ -150,9 +152,17 @@ function filterIsDefault(f: FilterState): boolean {
 
 type DualPmsPanelProps = {
   signedIn: boolean
+  /** RFID encoder connected — required to show Encode key. */
+  encoderConnected?: boolean
+  /** Housekeepers cannot encode keys. */
+  userRole?: string | null
 }
 
-export function DualPmsPanel({ signedIn }: DualPmsPanelProps) {
+export function DualPmsPanel({
+  signedIn,
+  encoderConnected = false,
+  userRole = null,
+}: DualPmsPanelProps) {
   const [boardRows, setBoardRows] = useState<PmsBoardRow[]>([])
   const [roomNumbers, setRoomNumbers] = useState<string[]>([])
   const [syncState, setSyncState] = useState<PmsSyncState>({})
@@ -168,6 +178,7 @@ export function DualPmsPanel({ signedIn }: DualPmsPanelProps) {
   const [sortBy, setSortBy] = useState<SortKey>('room_number')
   const [sortAsc, setSortAsc] = useState(true)
   const [filter, setFilter] = useState<FilterState>(defaultFilter)
+  const [checkedInOnly, setCheckedInOnly] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
   const [filtersOpen, setFiltersOpen] = useState(true)
   const [showAvailability, setShowAvailability] = useState(false)
@@ -177,6 +188,10 @@ export function DualPmsPanel({ signedIn }: DualPmsPanelProps) {
   const [hkBusy, setHkBusy] = useState(false)
   const [hkError, setHkError] = useState<string | null>(null)
   const [hkMessage, setHkMessage] = useState<string | null>(null)
+  const [encodeBusy, setEncodeBusy] = useState(false)
+  const [encodeMessage, setEncodeMessage] = useState<string | null>(null)
+
+  const canEncodeKeys = userRole !== 'housekeeper'
 
   const closeHkDialog = useCallback(() => {
     setHkDialogOpen(false)
@@ -189,12 +204,14 @@ export function DualPmsPanel({ signedIn }: DualPmsPanelProps) {
     setHkRequestStatus(0)
     setHkError(null)
     setHkDialogOpen(false)
+    setEncodeMessage(null)
   }, [])
 
   const toggleRoomSelection = useCallback((roomNumber: string, checked: boolean) => {
     setShowAvailability(false)
     setHkMessage(null)
     setHkError(null)
+    setEncodeMessage(null)
     const key = roomNumber.trim()
     setSelectedRooms((prev) =>
       checked ? (prev.includes(key) ? prev : [...prev, key]) : prev.filter((r) => r !== key),
@@ -330,10 +347,15 @@ export function DualPmsPanel({ signedIn }: DualPmsPanelProps) {
     [enriched, filter],
   )
 
+  const afterCheckedInFilter = useMemo(() => {
+    if (!checkedInOnly) return afterColumnFilter
+    return afterColumnFilter.filter((r) => isDualPmsCheckedIn(r))
+  }, [afterColumnFilter, checkedInOnly])
+
   const visible = useMemo(() => {
-    if (!searchQuery.trim()) return afterColumnFilter
-    return afterColumnFilter.filter((r) => matchesSearch(r, searchQuery))
-  }, [afterColumnFilter, searchQuery])
+    if (!searchQuery.trim()) return afterCheckedInFilter
+    return afterCheckedInFilter.filter((r) => matchesSearch(r, searchQuery))
+  }, [afterCheckedInFilter, searchQuery])
 
   const sorted = useMemo(() => {
     const dir = sortAsc ? 1 : -1
@@ -380,6 +402,7 @@ export function DualPmsPanel({ signedIn }: DualPmsPanelProps) {
       setShowAvailability(false)
       setHkMessage(null)
       setHkError(null)
+      setEncodeMessage(null)
       setSelectedRooms((prev) => {
         if (checked) {
           return [...new Set([...prev, ...visibleRoomNumbers])]
@@ -454,10 +477,12 @@ export function DualPmsPanel({ signedIn }: DualPmsPanelProps) {
   const totalRooms = roomNumbers.length || sorted.length
   const filteredCount = sorted.length
   const hasActiveSearch = Boolean(searchQuery.trim())
-  const columnFiltersActive = !filterIsDefault(filter) || afterColumnFilter.length !== enriched.length
+  const columnFiltersActive =
+    !filterIsDefault(filter) || checkedInOnly || afterColumnFilter.length !== enriched.length
   const showingSubset = filteredCount !== totalRooms
 
   const applyVacantCleanPreset = () => {
+    setCheckedInOnly(false)
     setFilter({
       ...defaultFilter(),
       synxis_occ: ['Vacant'],
@@ -467,12 +492,98 @@ export function DualPmsPanel({ signedIn }: DualPmsPanelProps) {
   }
 
   const applyVacantPreset = () => {
+    setCheckedInOnly(false)
     setFilter({
       ...defaultFilter(),
       synxis_occ: ['Vacant'],
       ezee_occ: ['Vacant'],
     })
   }
+
+  const applyCheckedInPreset = () => {
+    // Keep column filters wide — `checkedInOnly` excludes Arriving / vacant.
+    setCheckedInOnly(true)
+    setFilter(defaultFilter())
+    setEncodeMessage(null)
+  }
+
+  const selectedEncodeTarget = useMemo(() => {
+    if (selectedRooms.length !== 1) return null
+    const room = selectedRooms[0]!
+    const row = enriched.find((r) => r.room_number === room)
+    if (!row || !isDualPmsCheckedIn(row)) return null
+    const checkoutYmd = normalizeHotelStayDate(null, row.merged_check_out_date)
+    if (!checkoutYmd) return null
+    const checkinYmd =
+      normalizeHotelStayDate(null, row.merged_check_in_date) ??
+      (() => {
+        const d = new Date()
+        const p = (n: number) => String(n).padStart(2, '0')
+        return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+      })()
+    return {
+      roomNumber: row.room_number,
+      guestName: row.merged_guest_name?.trim() || null,
+      checkinYmd,
+      checkoutYmd,
+    }
+  }, [selectedRooms, enriched])
+
+  const encodeDisabledReason = useMemo(() => {
+    if (!canEncodeKeys) return 'Housekeepers cannot encode keys'
+    if (!encoderConnected) return 'Connect the RFID encoder'
+    if (selectedRooms.length === 0) return 'Select one checked-in room'
+    if (selectedRooms.length > 1) return 'Select only one room to encode'
+    if (!selectedEncodeTarget) {
+      const row = enriched.find((r) => r.room_number === selectedRooms[0])
+      if (row && !isDualPmsCheckedIn(row)) return 'Room is not checked in (arriving excluded)'
+      if (row && !normalizeHotelStayDate(null, row.merged_check_out_date)) {
+        return 'Missing checkout date on Dual PMS for this room'
+      }
+      return 'Cannot encode this selection'
+    }
+    return null
+  }, [
+    canEncodeKeys,
+    encoderConnected,
+    selectedRooms,
+    selectedEncodeTarget,
+    enriched,
+  ])
+
+  const handleEncodeKey = useCallback(async () => {
+    if (!selectedEncodeTarget || encodeDisabledReason) return
+    setEncodeBusy(true)
+    setEncodeMessage(null)
+    setHkMessage(null)
+    setHkError(null)
+    const conf = `WALK-${selectedEncodeTarget.roomNumber}-${Date.now().toString(36).toUpperCase()}`
+    try {
+      const res = (await chrome.runtime.sendMessage({
+        type: 'KEYS_ADMIN_ENCODE',
+        roomNumber: selectedEncodeTarget.roomNumber,
+        checkinTime: selectedEncodeTarget.checkinYmd,
+        checkoutTime: selectedEncodeTarget.checkoutYmd,
+        confirmationNumber: conf,
+        guestName: selectedEncodeTarget.guestName,
+        cardSerial: 1,
+        frontDeskOccupied: true,
+        skipStayGates: true,
+      })) as { ok: boolean; error?: string; dbWarning?: string }
+      if (!res.ok) {
+        setEncodeMessage(res.error ?? 'Encode failed')
+        return
+      }
+      const warn = res.dbWarning ? ` (${res.dbWarning})` : ''
+      setEncodeMessage(
+        `Key encoded for room ${selectedEncodeTarget.roomNumber} · CO ${selectedEncodeTarget.checkoutYmd}${warn}`,
+      )
+    } catch (e) {
+      setEncodeMessage(e instanceof Error ? e.message : 'Encode failed')
+    } finally {
+      setEncodeBusy(false)
+    }
+  }, [selectedEncodeTarget, encodeDisabledReason])
 
   if (!signedIn) {
     return (
@@ -624,6 +735,14 @@ export function DualPmsPanel({ signedIn }: DualPmsPanelProps) {
           <div className="fdn-dualpms__filter-row">
             <span className="fdn-dualpms__filter-label">Quick</span>
             <div className="fdn-dualpms__chips fdn-dualpms__chips--quick">
+              <button
+                type="button"
+                className={`fdn-dualpms__chip fdn-dualpms__chip--quick${checkedInOnly ? ' fdn-dualpms__chip--on' : ''}`}
+                onClick={applyCheckedInPreset}
+                title="Show checked-in / stayover / due-out only (no arrivals)"
+              >
+                Checked in
+              </button>
               <button type="button" className="fdn-dualpms__chip fdn-dualpms__chip--quick" onClick={applyVacantCleanPreset}>
                 Vacant clean
               </button>
@@ -635,6 +754,7 @@ export function DualPmsPanel({ signedIn }: DualPmsPanelProps) {
                 className="fdn-dualpms__chip fdn-dualpms__chip--quick"
                 onClick={() => {
                   setFilter(defaultFilter())
+                  setCheckedInOnly(false)
                   setSearchQuery('')
                 }}
               >
@@ -749,13 +869,36 @@ export function DualPmsPanel({ signedIn }: DualPmsPanelProps) {
       ) : null}
 
       {hkMessage ? <p className="fdn-dualpms__hk-success">{hkMessage}</p> : null}
+      {encodeMessage ? (
+        <p
+          className={
+            encodeMessage.toLowerCase().includes('encoded')
+              ? 'fdn-dualpms__hk-success'
+              : 'fdn-dualpms__hk-error'
+          }
+        >
+          {encodeMessage}
+        </p>
+      ) : null}
 
       {selectedRooms.length > 0 ? (
         <div className="fdn-dualpms__hk-selection-bar">
           <span>
             {selectedRooms.length} room{selectedRooms.length === 1 ? '' : 's'} selected
+            {selectedEncodeTarget
+              ? ` · CO ${selectedEncodeTarget.checkoutYmd}${selectedEncodeTarget.guestName ? ` · ${selectedEncodeTarget.guestName}` : ''}`
+              : ''}
           </span>
-          <button type="button" className="fdn-btn fdn-btn--primary" onClick={() => setHkDialogOpen(true)}>
+          <button
+            type="button"
+            className="fdn-btn fdn-btn--primary"
+            disabled={Boolean(encodeDisabledReason) || encodeBusy}
+            title={encodeDisabledReason ?? 'Encode RFID key for this checked-in room'}
+            onClick={() => void handleEncodeKey()}
+          >
+            {encodeBusy ? 'Encoding…' : 'Encode key'}
+          </button>
+          <button type="button" className="fdn-btn fdn-btn--secondary" onClick={() => setHkDialogOpen(true)}>
             Mark clean / dirty
           </button>
           <button type="button" className="fdn-btn fdn-btn--secondary" onClick={clearHkSelection}>

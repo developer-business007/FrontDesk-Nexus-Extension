@@ -283,6 +283,11 @@ export type ExtensionMessage =
       managerPin?: string
       /** Front desk re-encoding an occupied room — skips PIN requirement, uses existing PMS dates. */
       frontDeskOccupied?: boolean
+      /**
+       * Dual PMS / Keys board encode: use message dates only — do not apply Key-tab
+       * reservation check-in or balance gates (those belong to a different guest).
+       */
+      skipStayGates?: boolean
     }
   /** Keys board — walk-in guest + first key (admin or manager PIN). */
   | {
@@ -424,6 +429,11 @@ export type ExtensionMessage =
       portalAdminEncode?: boolean
       /** Manager override PIN to bypass check-in / balance gates. */
       managerPin?: string
+      /**
+       * When true, skip Key-tab reservation check-in / balance gates and eZee
+       * detail refresh — encode uses the times/room on this message only.
+       */
+      skipStayGates?: boolean
     }
   | { type: 'RFID_READ_CARD' }
   /**

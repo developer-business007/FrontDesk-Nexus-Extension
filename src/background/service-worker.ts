@@ -314,12 +314,13 @@ async function runRfidMakeKey(msg: RfidMakeKeyMessage): Promise<ExtensionRespons
   const checkoutClock = settings.defaultCheckoutTime || '13:00'
 
   // Fresh eZee departure/room before encode — prevents overnight-expire cards from thin scrape.
+  // Board encodes (Dual PMS / Keys) pass dates explicitly — do not mutate Key-tab reservation.
   let roomNumber = msg.roomNumber.trim()
   let checkoutTime = msg.checkoutTime
   let checkinTime = msg.checkinTime
   const bookingId =
     msg.confirmationNumber?.trim() || reservation?.confirmationNumber?.trim() || ''
-  if (reservation?.pms === 'ezee' && bookingId) {
+  if (!msg.skipStayGates && reservation?.pms === 'ezee' && bookingId) {
     const detail = await fetchEzeeReservationDetailFromApi(bookingId)
     if (detail) {
       if (detail.roomNumber?.trim()) roomNumber = detail.roomNumber.trim()
@@ -365,7 +366,7 @@ async function runRfidMakeKey(msg: RfidMakeKeyMessage): Promise<ExtensionRespons
     settings.managerOverridePin.length > 0 &&
     msg.managerPin === settings.managerOverridePin
 
-  if (!isOverride) {
+  if (!isOverride && !msg.skipStayGates) {
     const keyBlocks: { type: 'not_checked_in' | 'balance_over_threshold'; message: string }[] = []
 
     // Check-in gate — applies to any PMS where pmsStatus is known
@@ -3246,6 +3247,7 @@ async function handleKeysAdminEncode(
     confirmationNumber: msg.confirmationNumber,
     guestName: msg.guestName,
     portalAdminEncode: true,
+    skipStayGates: Boolean(msg.skipStayGates),
   })
   return result as ExtensionResponse
 }
