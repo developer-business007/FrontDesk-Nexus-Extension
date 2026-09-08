@@ -336,6 +336,17 @@ export type ExtensionMessage =
       groupMembers?: EzeeGroupMember[]
       activeGroupIndex?: number
     }
+  /**
+   * One-click encode from eZee guest drawer / Guest Details.
+   * Loads stay (API enrich) then encodes RFID using encode-moment check-in.
+   */
+  | {
+      type: 'EZEE_DRAWER_ENCODE_KEY'
+      snapshot: ReservationSnapshot
+      guestDisplay: EzeeGuestDisplay
+      groupMembers?: EzeeGroupMember[]
+      activeGroupIndex?: number
+    }
   /** Folio / non-guest tab — clear stale eZee panel data in the service worker. */
   | { type: 'EZEE_SUPPRESS_GUEST_LOAD' }
   /** Content script on live.ipms247.com: user clicked "Print Guest Registration Card". */
@@ -513,8 +524,12 @@ export type ExtensionResponse =
       /** Housekeeping queue confirmation. */
       hkMessage?: string
       dbWarning?: string
+      /** Human-readable success detail (e.g. eZee drawer encode). */
+      message?: string
+      /** Room encoded (eZee drawer encode). */
+      roomNumber?: string
     }
-  | { ok: false; error: string; keyBlocks?: KeyBlock[] }
+  | { ok: false; error: string; keyBlocks?: KeyBlock[]; state?: ExtensionState }
 
 export type KeyBlockType = 'not_checked_in' | 'balance_over_threshold'
 export type KeyBlock = { type: KeyBlockType; message: string }

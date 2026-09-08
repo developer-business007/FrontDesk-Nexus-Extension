@@ -4,6 +4,7 @@ import {
   extractEzeeScrapeFieldsFromPage,
   ezeeScrapeToGuestDisplay,
   ezeeScrapeToSnapshot,
+  findOpenEzeeDrawerRoot,
   isCompleteEzeeGuestScrape,
   isEzeeFolioContext,
   isEzeeGuestDrawerOpen,
@@ -11,6 +12,11 @@ import {
   isEzeeReservationDetailShell,
   probeEzeeDrawer,
 } from '../lib/ezee-drawer-extract'
+import {
+  setEzeeEncodeButtonBusy,
+  setEzeeEncodeButtonResult,
+  syncEzeeEncodeButton,
+} from '../lib/ezee-encode-button'
 import {
   findGrCardOptionsModal,
   installGrCardModalPrintListener,
@@ -170,9 +176,93 @@ async function buildExtractPayloadWithRetry(): Promise<EzeeExtractPayload> {
   return last
 }
 
+let encodeClickInFlight = false
+
+async function onEzeeDrawerEncodeClick(): Promise<void> {
+  if (encodeClickInFlight) return
+  encodeClickInFlight = true
+  setEzeeEncodeButtonBusy(true)
+  try {
+    const payload = await buildExtractPayloadWithRetry()
+    if (!payload.ok) {
+      setEzeeEncodeButtonResult(false, payload.error)
+      return
+    }
+
+    const res = (await chrome.runtime.sendMessage({
+      type: 'EZEE_DRAWER_ENCODE_KEY',
+      snapshot: payload.snapshot,
+      guestDisplay: payload.guestDisplay,
+      ...(payload.groupMembers ? { groupMembers: payload.groupMembers } : {}),
+      ...(typeof payload.activeGroupIndex === 'number'
+        ? { activeGroupIndex: payload.activeGroupIndex }
+        : {}),
+    })) as { ok?: boolean; error?: string; message?: string; roomNumber?: string }
+
+    if (!res?.ok) {
+      setEzeeEncodeButtonResult(false, res?.error ?? 'Encode failed')
+      return
+    }
+
+    const room = res.roomNumber?.trim()
+    setEzeeEncodeButtonResult(
+      true,
+      res.message?.trim() || (room ? `Key encoded · Rm ${room}` : 'Key encoded'),
+    )
+  } catch (e) {
+    setEzeeEncodeButtonResult(
+      false,
+      e instanceof Error ? e.message : 'Encode failed — is the extension signed in?',
+    )
+  } finally {
+    encodeClickInFlight = false
+  }
+}
+
+/** Guest drawer or reservation detail shell where Edit / More / Print live. */
+function findEzeeEncodePanelRoot(): HTMLElement | null {
+  const drawer = findOpenEzeeDrawerRoot(document)
+  if (drawer) return drawer
+  if (!isEzeeReservationDetailShell(document)) return null
+  if (!isEzeeGuestScrapeAllowed(document)) return null
+
+  // Prefer a header/toolbar that already has Edit/More/Print
+  for (const el of document.querySelectorAll<HTMLElement>('button, a, .ant-btn')) {
+    const t = (el.textContent ?? '').replace(/\s+/g, ' ').trim().toLowerCase()
+    if (t !== 'edit' && t !== 'more' && t !== 'print') continue
+    const host =
+      el.closest<HTMLElement>('header, .ant-page-header, [class*="header"], [class*="toolbar"]') ??
+      el.parentElement?.parentElement
+    if (host) return host
+  }
+
+  return (
+    document.querySelector<HTMLElement>('.ant-layout-content') ??
+    document.querySelector<HTMLElement>('main') ??
+    document.body
+  )
+}
+
+function syncEncodeButtonMount(): void {
+  if (!location.pathname.startsWith('/unity/reservations')) {
+    syncEzeeEncodeButton(null, onEzeeDrawerEncodeClick)
+    return
+  }
+  if (!isEzeeGuestScrapeAllowed(document) && !isEzeeGuestDrawerOpen(document)) {
+    syncEzeeEncodeButton(null, onEzeeDrawerEncodeClick)
+    return
+  }
+  syncEzeeEncodeButton(findEzeeEncodePanelRoot(), onEzeeDrawerEncodeClick)
+}
+
 async function runDetection(): Promise<void> {
   // Only auto-detect guests on the reservations list page, not other eZee pages.
-  if (!location.pathname.startsWith('/unity/reservations')) return
+  if (!location.pathname.startsWith('/unity/reservations')) {
+    syncEncodeButtonMount()
+    return
+  }
+
+  syncEncodeButtonMount()
 
   if (!isEzeeGuestScrapeAllowed(document)) {
     if (isEzeeFolioContext(document)) {

@@ -1240,6 +1240,125 @@ async function completeEzeeReservationFromSnapshot(
   return { ok: true, state: await getState(), message: msgText }
 }
 
+/**
+ * One-click encode from eZee drawer button: load stay (API enrich) → encode RFID.
+ * Applies check-in + balance gates for this guest (does not skipStayGates).
+ */
+async function handleEzeeDrawerEncodeKey(
+  msg: Extract<ExtensionMessage, { type: 'EZEE_DRAWER_ENCODE_KEY' }>,
+  sender: chrome.runtime.MessageSender,
+): Promise<ExtensionResponse> {
+  const client = getClient()
+  const { data: sess } = await client.auth.getSession()
+  if (!sess.session) {
+    return { ok: false, error: 'Sign in to FrontDesk Nexus before encoding a key.' }
+  }
+  if (cachedRole === 'housekeeper') {
+    return { ok: false, error: 'Housekeepers cannot encode keys.' }
+  }
+
+  // Refresh RFID status before failing open/closed
+  try {
+    const raw = await sendNativeRequest({ type: 'RFID_HANDSHAKE' })
+    handleRfidStatus(!!raw.connected, raw.error ? String(raw.error) : null)
+    rfidStatusCheckedAt = Date.now()
+  } catch (e) {
+    handleRfidStatus(false, e instanceof Error ? e.message : 'Native host unreachable')
+  }
+  if (rfidConnected !== 'connected') {
+    return {
+      ok: false,
+      error: rfidError?.trim() || 'RFID encoder is not connected — check the native host.',
+    }
+  }
+
+  const conf = (msg.snapshot.confirmationNumber ?? '').trim()
+  if (!isValidEzeeReservationNumber(conf)) {
+    return { ok: false, error: 'Could not read reservation number from the eZee drawer.' }
+  }
+
+  const tabId = sender.tab?.id ?? (await findEzeeTab())?.id
+  if (tabId == null) {
+    return { ok: false, error: 'Could not find the eZee tab — reload eZee and try again.' }
+  }
+  const tabUrl = sender.tab?.url ?? 'https://live.ipms247.com/'
+
+  const loaded = await completeEzeeReservationFromSnapshot(
+    tabId,
+    tabUrl,
+    msg.snapshot,
+    msg.guestDisplay,
+    { chromeNotify: false, panelToast: false },
+    msg.groupMembers,
+    msg.activeGroupIndex,
+  )
+  if (!loaded || typeof loaded !== 'object' || !('ok' in loaded) || loaded.ok !== true) {
+    const err =
+      loaded && typeof loaded === 'object' && 'error' in loaded && typeof loaded.error === 'string'
+        ? loaded.error
+        : 'Could not load stay from eZee for encoding.'
+    return { ok: false, error: err }
+  }
+
+  if (!reservation?.roomNumber?.trim()) {
+    return {
+      ok: false,
+      error: 'Room number is missing — wait for stay details to load, then try Encode again.',
+    }
+  }
+  if (!reservation.checkOutDate?.trim()) {
+    return {
+      ok: false,
+      error: 'Departure / checkout is missing — refresh the guest in eZee and try again.',
+    }
+  }
+
+  const status = reservation.pmsStatus ?? msg.guestDisplay.status ?? null
+  if (status != null && status !== '' && !isPmsCheckedIn(status)) {
+    return {
+      ok: false,
+      error: `Guest status is “${status}” — check in first (Encode works for Arrived / Stayover / Due out / Day use).`,
+    }
+  }
+
+  const now = new Date()
+  const p = (n: number) => String(n).padStart(2, '0')
+  const checkinNow = `${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}${p(now.getHours())}${p(now.getMinutes())}`
+
+  const result = await runRfidMakeKey({
+    type: 'RFID_MAKE_KEY',
+    roomNumber: reservation.roomNumber,
+    checkinTime: checkinNow,
+    checkoutTime: reservation.checkOutDate,
+    cardSerial: 1,
+    confirmationNumber: reservation.confirmationNumber ?? conf,
+    guestName: reservation.guestName ?? msg.guestDisplay.nameLine ?? null,
+  })
+
+  if (!result || typeof result !== 'object' || !('ok' in result) || result.ok !== true) {
+    const fail = result as { error?: string; keyBlocks?: { message: string }[] }
+    const blockMsg = fail.keyBlocks?.map((b) => b.message).join(' ') || null
+    const err = blockMsg || fail.error || 'Key encoding failed'
+    void notifyUser('FrontDesk Nexus — Encode failed', err)
+    return { ok: false, error: err, state: await getState() }
+  }
+
+  const room = reservation.roomNumber
+  const okMsg = `Key encoded for room ${room}`
+  void notifyUser('FrontDesk Nexus', `#${conf} — ${okMsg}`)
+  broadcastPanelToast({
+    confirmationNumber: conf,
+    variant: 'success',
+    detail: okMsg,
+  })
+  return {
+    ok: true,
+    state: await getState(),
+    message: okMsg,
+    roomNumber: room,
+  }
+}
+
 async function selectEzeeGroupMember(index: number): Promise<ExtensionResponse> {
   if (ezeeGroupMembers.length <= 1) {
     return { ok: false, error: 'No group reservation loaded' }
@@ -3960,6 +4079,10 @@ async function handleMessage(
     } finally {
       ezeeAutoInFlight.delete(fk)
     }
+  }
+
+  if (msg.type === 'EZEE_DRAWER_ENCODE_KEY') {
+    return handleEzeeDrawerEncodeKey(msg, _sender)
   }
 
   if (msg.type === 'SYNXIS_AUTO_GUEST_DETECTED') {
