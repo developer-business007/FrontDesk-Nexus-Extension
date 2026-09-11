@@ -89,6 +89,7 @@ import { initNativeHost, sendNativeMessage, sendNativeRequest } from '../nativeH
 import { checkMinExtensionVersion } from '../lib/version-check'
 import {
   toSdkDatetimeHotel,
+  toSdkKeyCheckoutHotel,
   validateKeyValidityWindow,
   verifyEncodedCardMatches,
 } from '../lib/hotel-dates'
@@ -354,7 +355,8 @@ async function runRfidMakeKey(msg: RfidMakeKeyMessage): Promise<ExtensionRespons
   }
 
   const checkinSdk = toSdkDatetimeHotel(checkinTime, 14)
-  const checkoutSdk = toSdkDatetimeHotel(checkoutTime, checkoutClock)
+  // Always Settings checkout clock on PMS departure *date* — ignore PMS 9/11 AM clocks.
+  const checkoutSdk = toSdkKeyCheckoutHotel(checkoutTime, checkoutClock)
   const windowErr = validateKeyValidityWindow(checkinSdk, checkoutSdk)
   if (windowErr) {
     return { ok: false, error: windowErr }
@@ -4497,7 +4499,7 @@ async function handleMessage(
           error: 'Departure / checkout is missing — refresh stay before encoding a lost key.',
         }
       }
-      const checkoutSdk = toSdkDatetimeHotel(checkoutTime, checkoutClock)
+      const checkoutSdk = toSdkKeyCheckoutHotel(checkoutTime, checkoutClock)
       if (!/^\d{12}$/.test(checkoutSdk)) {
         return { ok: false, error: 'Invalid checkout time — refresh stay and try again.' }
       }

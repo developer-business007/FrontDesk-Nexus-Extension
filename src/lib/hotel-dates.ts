@@ -141,6 +141,53 @@ export function toSdkDatetimeHotel(s: string, defaultClock: number | string): st
   return t
 }
 
+/**
+ * Key-card checkout / expiry for RFID encode.
+ * Always uses the **calendar departure date** from PMS + hotel Settings checkout clock
+ * (e.g. 13:00). PMS departure times (9 AM / 11 AM) must not expire the key early.
+ */
+export function toSdkKeyCheckoutHotel(s: string, defaultClock: number | string): string {
+  const t = s.trim()
+  if (!t) return t
+
+  const { hour, minute } = resolveDefaultClock(defaultClock)
+
+  let ymd: string | null = null
+  if (/^\d{12}$/.test(t)) {
+    ymd = `${t.slice(0, 4)}-${t.slice(4, 6)}-${t.slice(6, 8)}`
+  } else {
+    const localDt = /^(\d{4})-(\d{2})-(\d{2})T/.exec(t)
+    if (localDt) {
+      ymd = `${localDt[1]}-${localDt[2]}-${localDt[3]}`
+    } else {
+      ymd =
+        normalizeHotelStayDate(null, t) ??
+        calendarDateFromUtcIso(t) ??
+        (/^\d{4}-\d{2}-\d{2}$/.test(t) ? t : null)
+    }
+  }
+
+  if (!ymd || !/^\d{4}-\d{2}-\d{2}$/.test(ymd)) {
+    return toSdkDatetimeHotel(t, defaultClock)
+  }
+
+  const [y, mo, d] = ymd.split('-').map(Number)
+  const date = new Date(y!, mo! - 1, d!, hour, minute, 0, 0)
+  return `${date.getFullYear()}${pad2(date.getMonth() + 1)}${pad2(date.getDate())}${pad2(date.getHours())}${pad2(date.getMinutes())}`
+}
+
+/** Display key expiry using Settings checkout clock (not PMS departure clock). */
+export function formatHotelKeyCheckout(
+  s: string | null | undefined,
+  defaultClock: number | string = '13:00',
+): string {
+  if (!s?.trim()) return '—'
+  const sdk = toSdkKeyCheckoutHotel(s.trim(), defaultClock)
+  const d = parseSdkDatetime(sdk)
+  if (d) return formatLocalDateTime(d)
+  return formatHotelDateTime(s, defaultClock)
+}
+
 /** Parse SDK `yyyyMMddHHmm` to a local Date. */
 export function parseSdkDatetime(sdk: string): Date | null {
   const t = sdk.trim()

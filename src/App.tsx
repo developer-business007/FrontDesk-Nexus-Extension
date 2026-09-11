@@ -69,7 +69,7 @@ import {
   isCompletePhoneForLookup,
   validatePhoneNumber,
 } from './lib/phone-lookup'
-import { formatHotelDateTime, validateKeyValidityWindow, toSdkDatetimeHotel } from './lib/hotel-dates'
+import { formatHotelDateTime, formatHotelKeyCheckout, validateKeyValidityWindow, toSdkDatetimeHotel, toSdkKeyCheckoutHotel } from './lib/hotel-dates'
 import { GuestStaySummary } from './components/GuestStaySummary'
 import { CheckInHistoryPanel } from './components/CheckInHistoryPanel'
 import { SignaturesPdfPanel } from './components/SignaturesPdfPanel'
@@ -2654,7 +2654,7 @@ function App() {
         `${_now.getFullYear()}${_p(_now.getMonth() + 1)}${_p(_now.getDate())}${_p(_now.getHours())}${_p(_now.getMinutes())}`
       const checkoutClock = state?.defaultCheckoutTime || '13:00'
       const checkinSdk = toSdkDatetimeHotel(checkinNow, 14)
-      const checkoutSdk = toSdkDatetimeHotel(res.checkOutDate, checkoutClock)
+      const checkoutSdk = toSdkKeyCheckoutHotel(res.checkOutDate, checkoutClock)
       const windowErr = validateKeyValidityWindow(checkinSdk, checkoutSdk)
       if (windowErr) {
         setKeyNotice(windowErr)
@@ -2695,7 +2695,7 @@ function App() {
       setOverridePinInput('')
       setOverridePinError(null)
 
-      const untilLabel = formatHotelDateTime(res.checkOutDate, checkoutClock)
+      const untilLabel = formatHotelKeyCheckout(res.checkOutDate, checkoutClock)
       if (result.dbWarning) {
         setKeyNotice(
           `Key ${serial} encoded & verified — Rm ${res.roomNumber} until ${untilLabel}. Warning: ${result.dbWarning}`,
@@ -2894,7 +2894,7 @@ function App() {
       setSessionCheckinTime(null)
       setSessionNextSerial(2)
       void refreshKeyHistory()
-      const untilLabel = formatHotelDateTime(
+      const untilLabel = formatHotelKeyCheckout(
         res.checkOutDate,
         state?.defaultCheckoutTime || '13:00',
       )
@@ -4191,7 +4191,7 @@ function App() {
                     <p style={{ margin: 0 }}>
                       <strong>Will encode</strong> — Rm <strong>{res.roomNumber}</strong>, valid until{' '}
                       <strong>
-                        {formatHotelDateTime(res.checkOutDate, state.defaultCheckoutTime || '13:00')}
+                        {formatHotelKeyCheckout(res.checkOutDate, state.defaultCheckoutTime || '13:00')}
                       </strong>
                       {res.confirmationNumber ? (
                         <>
@@ -4201,7 +4201,7 @@ function App() {
                       ) : null}
                     </p>
                     <p className="fdn-help" style={{ margin: '4px 0 0' }}>
-                      Confirm departure matches the PMS before placing a card on the encoder.
+                      Key expires at Settings default checkout time on the PMS departure date.
                     </p>
                   </div>
 
